@@ -81,6 +81,73 @@ assert.doesNotMatch(panelSource, /command:[^\n]*(secret|token)/i);
 assert.doesNotMatch(serviceSource, /environment:/);
 assert.doesNotMatch(panelSource, /environment:/);
 
+// ---------------------------------------------------------- keys view
+
+assert.ok(fs.existsSync(new URL('./KeysView.qml', import.meta.url)), 'KeysView.qml exists on disk');
+const keysViewSource = fs.readFileSync(new URL('./KeysView.qml', import.meta.url), 'utf8');
+
+// SECURITY: the key travels over stdin only. The Process command arrays hold
+// fixed constants (cliPath + the activeId property fed from
+// Model.keyProviderIds()) and never any TextField binding.
+assert.match(keysViewSource,
+  /command:\s*\["\/usr\/bin\/env",\s*"python3",\s*root\.cliPath,\s*"key",\s*"set",\s*root\.activeId\]/);
+assert.match(keysViewSource,
+  /command:\s*\["\/usr\/bin\/env",\s*"python3",\s*root\.cliPath,\s*"key",\s*"clear",\s*root\.activeId\]/);
+for (const line of keysViewSource.split('\n'))
+  if (/command:/.test(line)) {
+    assert.doesNotMatch(line, /\.text\b/, 'no TextField text in a command array');
+    assert.doesNotMatch(line, /keyField|pendingKey/, 'no key value in a command array');
+  }
+assert.doesNotMatch(keysViewSource, /environment:/);
+// The key is written to stdin in onStarted, dropped immediately after the
+// write, and the channel is closed so `key set` (stdin.read to EOF) returns.
+assert.match(keysViewSource, /stdinEnabled:\s*true/);
+assert.match(keysViewSource,
+  /onStarted:\s*\{\s*write\(root\.pendingKey \+ "\\n"\)\s*root\.pendingKey = ""\s*\/\/[^\n]*\n\s*stdinEnabled = false/);
+// The input field is a masked qs.Ui TextField; the field is cleared on submit.
+assert.match(keysViewSource, /password:\s*true/);
+assert.match(keysViewSource, /field\.text = ""/);
+// Single-flight: one busy flag covering both processes gates every button.
+assert.match(keysViewSource, /readonly property bool busy: saveProcess\.running \|\| clearProcess\.running/);
+// The provider console pages open through the Model URL table only.
+assert.match(keysViewSource, /Qt\.openUrlExternally\(card\.meta\.url\)/);
+assert.doesNotMatch(keysViewSource, /Qt\.openUrlExternally\("/);
+// Errors surface through the sanitized Model helper, not raw stderr.
+assert.match(keysViewSource, /Model\.keyCommandErrorMessage\(/);
+
+// Panel wiring: catcher blocked while the keys view is open or a field is
+// focused (dev-gallery pattern); unconfigured rows open the keys view; the
+// keys view reuses the panel's forced sync; the terminal launcher is gone.
+assert.match(panelSource, /blocked:\s*root\.keysOpen\s*\|\|[^\n]*fieldFocused/);
+assert.match(panelSource, /onSyncRequested:\s*root\.refresh\(\)/);
+assert.match(panelSource, /onCloseRequested:\s*root\.closeKeys\(\)/);
+assert.match(panelSource, /onClicked:\s*root\.openKeys\(\)/);
+assert.doesNotMatch(panelSource, /openSetup|Set up keys/);
+
+// The exact console URL per provider, asserted against the Model table.
+const KEY_URLS = {
+  'openrouter': 'https://openrouter.ai/settings/management-keys',
+  'vercel-ai': 'https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fapi-keys&title=AI+Gateway+API+Keys',
+  'elevenlabs': 'https://elevenlabs.io/app/developers/api-keys',
+  'openai-api': 'https://platform.openai.com/settings/organization/admin-keys',
+  'anthropic-api': 'https://platform.claude.com/settings/admin-keys'
+};
+assert.deepEqual(JSON.parse(JSON.stringify(model.keyProviderIds())), Object.keys(KEY_URLS));
+for (const [id, url] of Object.entries(KEY_URLS)) {
+  const meta = model.providerKeyMeta(id);
+  assert.equal(meta.id, id);
+  assert.equal(meta.url, url);
+  assert.ok(meta.label.length > 0);
+  assert.ok(meta.note.length > 0);
+}
+assert.equal(model.providerKeyMeta('openai-api').needsLedger, true);
+assert.equal(model.providerKeyMeta('anthropic-api').needsLedger, true);
+assert.equal(model.providerKeyMeta('openrouter').needsLedger, false);
+assert.equal(model.providerKeyMeta('vercel-ai').needsLedger, false);
+assert.equal(model.providerKeyMeta('elevenlabs').needsLedger, false);
+assert.equal(model.providerKeyMeta('nope'), null);
+assert.equal(model.providerKeyMeta(null), null);
+
 // ---------------------------------------------------------- parseSnapshot
 
 const snapshotRaw = JSON.stringify({
@@ -416,5 +483,29 @@ assert.equal(model.refreshStatusMessage(2, 'config unreadable'), 'Configuration 
 assert.match(model.refreshStatusMessage(127, ''), /python3 was not found/);
 assert.equal(model.refreshStatusMessage(3, 'traceback text'), 'traceback text');
 assert.equal(model.refreshStatusMessage(3, ''), 'The sync command failed without an error message.');
+
+// ----------------------------------------------------- key entry helpers
+
+// Configured state is derived from the current snapshot only.
+assert.equal(model.providerConfigured(snap, 'openrouter'), true);
+assert.equal(model.providerConfigured(snap, 'openai-api'), true);
+assert.equal(model.providerConfigured(snap, 'anthropic-api'), false);
+assert.equal(model.providerConfigured(null, 'openrouter'), false);
+assert.equal(model.providerConfigured(snap, 'nope'), false);
+// An errored provider still counts as configured (it has a key).
+assert.equal(model.providerConfigured(allErrored, 'openrouter'), true);
+
+assert.equal(model.ledgerHint('/abs/cli', 'openai-api'),
+  'Also needs a funded ledger: python3 /abs/cli ledger set openai-api --funded N --since YYYY-MM-DD');
+
+assert.equal(model.keyCommandErrorMessage(0, 'noise'), '');
+assert.match(model.keyCommandErrorMessage(127, ''), /python3 was not found/);
+assert.equal(model.keyCommandErrorMessage(1, 'error: empty key\n'), 'error: empty key');
+assert.equal(model.keyCommandErrorMessage(1, ''), 'The key command failed (exit 1).');
+// Stderr tail only, sanitized (controls stripped, angle brackets replaced).
+assert.equal(model.keyCommandErrorMessage(1, 'line1\nline2\n<script>' + String.fromCharCode(0) + 'boom'),
+  'line2 \u00b7 \u2039script\u203aboom');
+// Capped: a huge traceback cannot flood the row.
+assert.ok(model.keyCommandErrorMessage(1, 'x'.repeat(5000)).length <= 301);
 
 console.log('Balances model tests passed');

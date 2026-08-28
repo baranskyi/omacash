@@ -404,6 +404,82 @@ function providerRows(model, nowMs) {
   return rows
 }
 
+// ------------------------------------------------------------- key entry
+
+// Static, non-secret metadata for the in-panel key entry view (KeysView.qml).
+// URLs are fixed constants pointing at each provider's own console — the
+// exact page that issues the key type the CLI needs.
+var KEY_META = {
+  "openrouter": {
+    label: "OpenRouter",
+    url: "https://openrouter.ai/settings/management-keys",
+    note: "Management key; a regular key limits the widget to per-key data"
+  },
+  "vercel-ai": {
+    label: "Vercel AI Gateway",
+    url: "https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fapi-keys&title=AI+Gateway+API+Keys",
+    note: "AI Gateway API key (not a Vercel account token)"
+  },
+  "elevenlabs": {
+    label: "ElevenLabs",
+    url: "https://elevenlabs.io/app/developers/api-keys",
+    note: "API key — enable only the User: Read scope"
+  },
+  "openai-api": {
+    label: "OpenAI API",
+    url: "https://platform.openai.com/settings/organization/admin-keys",
+    note: "Admin key sk-admin-…",
+    needsLedger: true
+  },
+  "anthropic-api": {
+    label: "Anthropic API",
+    url: "https://platform.claude.com/settings/admin-keys",
+    note: "Admin key sk-ant-admin…; requires a Console organization",
+    needsLedger: true
+  }
+}
+
+function keyProviderIds() {
+  return PROVIDER_ORDER.slice()
+}
+
+function providerKeyMeta(id) {
+  var meta = KEY_META[String(id || "")]
+  if (!meta) return null
+  return {
+    id: String(id),
+    label: meta.label,
+    url: meta.url,
+    note: meta.note,
+    needsLedger: meta.needsLedger === true
+  }
+}
+
+// Configured state comes from the current snapshot only — no extra CLI call.
+function providerConfigured(model, id) {
+  var p = findProvider(model, String(id || ""))
+  return p !== null && p.status !== "unconfigured"
+}
+
+// Snapshot-hint style: the full invocation, since the CLI is not on PATH.
+function ledgerHint(cliPath, id) {
+  return "Also needs a funded ledger: python3 " + cleanText(cliPath, 300).trim()
+    + " ledger set " + String(id || "") + " --funded N --since YYYY-MM-DD"
+}
+
+// Row error for a failed `key set` / `key clear` run: the stderr tail,
+// sanitized and capped, never echoing anything the user typed.
+function keyCommandErrorMessage(exitCode, stderrText) {
+  var code = Number(exitCode)
+  if (code === 0) return ""
+  if (code === 127)
+    return "python3 was not found. Install it with: sudo pacman -S python"
+  var text = cleanText(stderrText, 2000).trim()
+  if (text === "") return "The key command failed (exit " + code + ")."
+  var lines = text.split("\n").filter(function(line) { return line.trim() !== "" })
+  return autoTextSafe(cleanText(lines.slice(-2).join(" · "), 300))
+}
+
 // ---------------------------------------------------------------- settings
 
 function booleanSetting(value, fallback) {

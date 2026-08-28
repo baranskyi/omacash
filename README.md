@@ -34,20 +34,30 @@ Pick a bar section when prompted (default: right). The pill shows `$ …` until 
 
 ### Configure keys
 
+**Primary path — in the panel.** Click the pill, press **Keys** (or click any
+"not configured" provider row). Each provider block shows whether a key is stored, says
+which key type that provider needs, links straight to the console page that issues it
+("Open key page ↗"), and takes a paste into a masked field. Save sends the key to the CLI
+over stdin and re-syncs immediately, so the row flips to "Configured ✓" and the pill
+updates. Keys you need:
+
+- **OpenRouter** — a [Management key](https://openrouter.ai/settings/management-keys) for the account balance. A regular inference key also works, but then the plugin can only show that key's own spend limit remainder.
+- **Vercel AI Gateway** — an [AI Gateway API key](https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fapi-keys&title=AI+Gateway+API+Keys) (the deep link resolves your team). Deliberately *not* a Vercel account token.
+- **ElevenLabs** — an [API key](https://elevenlabs.io/app/developers/api-keys) with only the **User: Read** scope. Such a key cannot generate audio or spend credits.
+- **OpenAI API** — an [Admin key](https://platform.openai.com/settings/organization/admin-keys) (`sk-admin-…`), required by OpenAI's Costs API.
+- **Anthropic API** — an [Admin key](https://platform.claude.com/settings/admin-keys) (`sk-ant-admin…`) from the Claude Console, required by Anthropic's cost report. Needs a Console organization.
+
+**Terminal alternative** (same storage, guided and live-tested):
+
 ```bash
 BAL="python3 $HOME/.config/omarchy/plugins/io.github.baranskyi.balances/bin/omarchy-balances"
 $BAL setup          # guided: paste each key (hidden input), live-tested immediately
 ```
 
-Or per provider: `$BAL key set openrouter` etc. Keys you need:
+Or per provider: `$BAL key set openrouter` etc.
 
-- **openrouter** — a [Management key](https://openrouter.ai/docs/features/provisioning-api-keys) for the account balance. A regular inference key also works, but then the plugin can only show that key's own spend limit remainder.
-- **vercel-ai** — an AI Gateway API key (Vercel dashboard → AI Gateway). Deliberately *not* a Vercel account token.
-- **elevenlabs** — an API key with only the **User: Read** scope. Such a key cannot generate audio or spend credits.
-- **openai-api** — an [Admin key](https://platform.openai.com/settings/organization/admin-keys) (`sk-admin-…`), required by OpenAI's Costs API.
-- **anthropic-api** — an Admin key (`sk-ant-admin…`) from the Claude Console, required by Anthropic's cost report. Needs a Console organization.
-
-For OpenAI/Anthropic also record what you have funded:
+For OpenAI/Anthropic also record what you have funded (the panel's Keys view reminds you
+of the exact command):
 
 ```bash
 $BAL ledger set openai-api --funded 60 --since 2026-08-01
@@ -59,16 +69,18 @@ currency unit against the Console once), and `$BAL sync --force` fills the bar.
 
 ### Key security
 
-Keys are read from hidden stdin only, stored in
+Keys are read from stdin only — hidden input in the terminal, a `Process` stdin write from
+the panel's Keys view — stored in
 `~/.local/state/omarchy/io.github.baranskyi.balances/secrets.json` (mode 600), sent only as
 HTTP headers to the provider's own API host, and never appear in process arguments,
-`shell.json`, agents records, or logs. The OpenAI/Anthropic admin keys and the OpenRouter
+`shell.json`, agents records, or logs. The Keys view clears its input field the moment you
+press Save. The OpenAI/Anthropic admin keys and the OpenRouter
 management key are powerful credentials — this plugin only reads with them, but treat the
 machine's disk as their security boundary.
 
 ## Use
 
-- **Left-click** the pill — popup with all balances (j/k scroll, r refresh, Esc close).
+- **Left-click** the pill — popup with all balances (j/k scroll, r refresh, Esc close). The **Keys** footer button opens in-panel key entry; Esc there first returns to the balances list.
 - **Right-click** — refresh now. **Wheel** — cycle the pinned provider (in `pinned` mode).
 - The same balances appear as tabs in Omarchy's built-in **Agents** panel; enable its
   `syncMode` to carry them to your other machines.

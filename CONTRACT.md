@@ -106,6 +106,8 @@ Panel facts (verified in /usr/share/omarchy/shell/plugins/agents/): tab shows if
 
 Flat `{ "<provider-id>": "<key>" }`. Written only by `key set`/`setup` (stdin/getpass). Env overrides honored for doctor/testing only: `OPENROUTER_KEY`, `VERCEL_AI_GATEWAY_KEY`, `ELEVENLABS_API_KEY`, `OPENAI_ADMIN_KEY`, `ANTHROPIC_ADMIN_KEY`.
 
+In-panel key entry: `omarchy/KeysView.qml` (opened from the popup's "Keys" footer button or by clicking an unconfigured row) is the second writer path for the stdin-only rule. It runs the same `key set <id>` / `key clear <id>` CLI through a Quickshell `Process` whose command array holds only fixed constants (the CLI path plus a provider id from the list above); the key value itself is delivered exclusively via `write(key + "\n")` on the process's stdin (`stdinEnabled: true`, closed right after the write so the CLI's stdin read reaches EOF). The QML clears the input field on submit and drops the held value after the write, so the key never appears in argv, the environment, QML state after send, `shell.json`, or logs. There are therefore exactly two writers of `secrets.json`: `setup`/`key set` in a terminal, and KeysView over `Process` stdin — both stdin-only. Configured/unconfigured state in the Keys view is read from the current snapshot (`status !== "unconfigured"`); no extra CLI status command exists for it.
+
 ## shell.json widget settings (read in QML via setting(name, fallback) — ALWAYS with fallback)
 
 - `pillMode`: "total" (default) | "attention" | "pinned"

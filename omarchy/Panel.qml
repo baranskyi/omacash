@@ -39,6 +39,7 @@ Panel {
   }
 
   property var snapshotModel: null
+  property bool keysOpen: false
   property string parseError: ""
   property string refreshError: ""
   property string refreshStderr: ""
@@ -118,12 +119,13 @@ Panel {
     return true
   }
 
-  function openSetup() {
-    if (!bar) return
-    var quoted = typeof bar.shellQuote === "function"
-      ? bar.shellQuote(cliPath) : "'" + cliPath + "'"
-    bar.run("omarchy-launch-floating-terminal-with-presentation python3 " + quoted + " setup")
-    root.close()
+  function openKeys() {
+    keysOpen = true
+  }
+
+  function closeKeys() {
+    keysOpen = false
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function switchPanel(direction) {
@@ -141,6 +143,7 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       nowMs = Date.now()
+      keysOpen = false
       if (panelFlick) panelFlick.contentY = 0
       snapshotFile.reload()
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -223,6 +226,11 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // Keys view: freeze the panel cursor while the view is open or one of
+      // its TextFields is being edited (dev-gallery "Popups + editors" rule).
+      // Esc then first leaves the keys view (handled inside KeysView), and
+      // only the next Esc reaches this catcher and closes the panel.
+      blocked: root.keysOpen || (keysLoader.item ? keysLoader.item.fieldFocused === true : false)
 
       onMoveRequested: function(dx, dy) {
         if (dy !== 0)
@@ -306,8 +314,32 @@ Panel {
             }
           }
 
+          Loader {
+            id: keysLoader
+            active: root.keysOpen
+            visible: root.keysOpen
+            width: parent.width
+
+            sourceComponent: KeysView {
+              width: column.width
+              foreground: root.foreground
+              urgent: root.urgent
+              fontFamily: root.fontFamily
+              cliPath: root.cliPath
+              snapshotModel: root.snapshotModel
+              onCloseRequested: root.closeKeys()
+              // The keys view reuses this panel's forced sync after every
+              // successful key set/clear.
+              onSyncRequested: root.refresh()
+            }
+
+            onLoaded: Qt.callLater(function() {
+              if (keysLoader.item) keysLoader.item.forceActiveFocus()
+            })
+          }
+
           Text {
-            visible: root.snapshotModel === null && root.parseError === ""
+            visible: !root.keysOpen && root.snapshotModel === null && root.parseError === ""
             width: parent.width
             topPadding: Style.space(16)
             text: "Waiting for the first sync…"
@@ -319,7 +351,7 @@ Panel {
           }
 
           Text {
-            visible: root.snapshotModel !== null && root.rows.length === 0
+            visible: !root.keysOpen && root.snapshotModel !== null && root.rows.length === 0
             width: parent.width
             topPadding: Style.space(16)
             text: "Every provider is disabled in config.json."
@@ -332,7 +364,7 @@ Panel {
 
           Column {
             id: providerSection
-            visible: root.rows.length > 0
+            visible: !root.keysOpen && root.rows.length > 0
             width: parent.width
             spacing: Style.space(10)
 
@@ -378,14 +410,13 @@ Panel {
             }
 
             Button {
-              visible: root.anyUnconfigured
-              text: "Set up keys"
+              text: root.keysOpen ? "Back" : "Keys"
               bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
               fontSize: Style.font.bodySmall
               verticalPadding: Style.spacing.controlPaddingY
-              onClicked: root.openSetup()
+              onClicked: root.keysOpen ? root.closeKeys() : root.openKeys()
             }
           }
 
@@ -403,86 +434,100 @@ Panel {
     }
   }
 
-  component ProviderRow: Column {
+  component ProviderRow: Item {
     id: providerRow
     property var row: null
 
-    spacing: Style.space(6)
+    implicitHeight: providerColumn.implicitHeight
     opacity: row && row.greyed ? 0.55 : 1
 
-    Item {
+    Column {
+      id: providerColumn
       width: parent.width
-      implicitHeight: Math.max(nameText.implicitHeight, valueText.implicitHeight)
+      spacing: Style.space(6)
 
-      Text {
-        id: nameText
-        text: providerRow.row ? providerRow.row.name : ""
-        textFormat: Text.PlainText
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        elide: Text.ElideRight
-        width: Math.min(implicitWidth, parent.width * 0.55)
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
+      Item {
+        width: parent.width
+        implicitHeight: Math.max(nameText.implicitHeight, valueText.implicitHeight)
+
+        Text {
+          id: nameText
+          text: providerRow.row ? providerRow.row.name : ""
+          textFormat: Text.PlainText
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+          width: Math.min(implicitWidth, parent.width * 0.55)
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+        }
+
+        Text {
+          id: tierText
+          text: providerRow.row ? providerRow.row.tier : ""
+          textFormat: Text.PlainText
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          anchors.left: nameText.right
+          anchors.leftMargin: Style.spacing.sm
+          anchors.right: valueText.left
+          anchors.rightMargin: Style.spacing.sm
+          anchors.verticalCenter: parent.verticalCenter
+        }
+
+        Text {
+          id: valueText
+          text: providerRow.row ? providerRow.row.value : ""
+          textFormat: Text.PlainText
+          color: providerRow.row && providerRow.row.valueRole !== ""
+            ? root.roleColor(providerRow.row.valueRole) : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+        }
+      }
+
+      Meter {
+        visible: providerRow.row && providerRow.row.percent >= 0
+        width: parent.width
+        value: providerRow.row ? providerRow.row.percent : 0
+        fill: providerRow.row ? root.roleColor(providerRow.row.meterRole) : root.foreground
       }
 
       Text {
-        id: tierText
-        text: providerRow.row ? providerRow.row.tier : ""
+        visible: text !== ""
+        width: parent.width
+        text: providerRow.row ? providerRow.row.sub : ""
         textFormat: Text.PlainText
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-        anchors.left: nameText.right
-        anchors.leftMargin: Style.spacing.sm
-        anchors.right: valueText.left
-        anchors.rightMargin: Style.spacing.sm
-        anchors.verticalCenter: parent.verticalCenter
+        wrapMode: Text.WordWrap
       }
 
       Text {
-        id: valueText
-        text: providerRow.row ? providerRow.row.value : ""
+        visible: text !== ""
+        width: parent.width
+        text: providerRow.row ? providerRow.row.note : ""
         textFormat: Text.PlainText
-        color: providerRow.row && providerRow.row.valueRole !== ""
-          ? root.roleColor(providerRow.row.valueRole) : root.foreground
+        color: providerRow.row ? root.roleColor(providerRow.row.noteRole) : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
-        font.bold: true
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
+        wrapMode: Text.WordWrap
       }
     }
 
-    Meter {
-      visible: providerRow.row && providerRow.row.percent >= 0
-      width: parent.width
-      value: providerRow.row ? providerRow.row.percent : 0
-      fill: providerRow.row ? root.roleColor(providerRow.row.meterRole) : root.foreground
-    }
-
-    Text {
-      visible: text !== ""
-      width: parent.width
-      text: providerRow.row ? providerRow.row.sub : ""
-      textFormat: Text.PlainText
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
-    }
-
-    Text {
-      visible: text !== ""
-      width: parent.width
-      text: providerRow.row ? providerRow.row.note : ""
-      textFormat: Text.PlainText
-      color: providerRow.row ? root.roleColor(providerRow.row.noteRole) : root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
+    // An unconfigured row is one-click entry into the keys view.
+    MouseArea {
+      anchors.fill: providerColumn
+      visible: providerRow.row ? providerRow.row.greyed === true : false
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.openKeys()
     }
   }
 
