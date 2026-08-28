@@ -1,0 +1,23 @@
+{
+  "refreshIntervalSec": 300,
+  "thresholds": {
+    "lowPercent": 0.20,
+    "lowUsd": "10",
+    "criticalPercent": 0.05,
+    "criticalUsd": "3"
+  },
+  "providers": {
+    "openrouter": { "enabled": true },
+    "vercel-ai": { "enabled": true },
+    "elevenlabs": { "enabled": true, "baseUrl": "https://api.elevenlabs.io" },
+    "openai-api": {
+      "enabled": true,
+      "ledger": { "entries": [ { "date": "2026-08-01", "amount": "60.00" } ] }
+    },
+    "anthropic-api": {
+      "enabled": true,
+      "amounts_are_cents": true,
+      "ledger": { "entries": [ { "date": "2026-07-15", "amount": "50.00" } ] }
+    }
+  }
+}

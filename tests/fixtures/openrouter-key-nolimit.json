@@ -1,0 +1,15 @@
+{
+  "data": {
+    "label": "personal",
+    "limit": null,
+    "limit_remaining": null,
+    "limit_reset": null,
+    "include_byok_in_limit": false,
+    "usage": 12.5,
+    "usage_daily": 0.1,
+    "usage_weekly": 1.05,
+    "usage_monthly": 3.25,
+    "byok_usage": 0,
+    "is_free_tier": false
+  }
+}

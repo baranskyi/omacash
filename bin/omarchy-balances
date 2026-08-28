@@ -1,0 +1,2067 @@
+#!/usr/bin/env python3
+"""omarchy-balances — backend CLI for the io.github.baranskyi.balances plugin. Contract: CONTRACT.md."""
+
+import argparse
+import contextlib
+import fcntl
+import getpass
+import hashlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
+
+PLUGIN_ID = "io.github.baranskyi.balances"
+PROVIDERS = ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api"]
+NAMES = {
+    "openrouter": "OpenRouter",
+    "vercel-ai": "Vercel AI",
+    "elevenlabs": "ElevenLabs",
+    "openai-api": "OpenAI API",
+    "anthropic-api": "Anthropic API",
+}
+LEDGER_PROVIDERS = ("openai-api", "anthropic-api")
+# Env overrides are honored by doctor/setup live tests only, never by sync.
+ENV_KEYS = {
+    "openrouter": "OPENROUTER_KEY",
+    "vercel-ai": "VERCEL_AI_GATEWAY_KEY",
+    "elevenlabs": "ELEVENLABS_API_KEY",
+    "openai-api": "OPENAI_ADMIN_KEY",
+    "anthropic-api": "ANTHROPIC_ADMIN_KEY",
+}
+UA = "omarchy-balances/0.1"
+# How this CLI is invoked in user-facing hints (self-generated, never provider-originated).
+INVOKE = "python3 " + os.path.abspath(__file__)
+TIMEOUT = 10
+BODY_CAP = 2 * 1024 * 1024
+STALE_MAX = timedelta(days=7)
+LOCK_WAIT = 15
+BACKOFF_CAP = 3600
+ANTHROPIC_VERSION = "2023-06-01"
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+CENT = Decimal("0.01")
+
+
+# ---------- paths / time / small helpers ----------
+
+def state_home():
+    return Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+def state_dir():
+    return state_home() / "omarchy" / PLUGIN_ID
+
+
+def cache_dir():
+    return state_dir() / "cache"
+
+
+def agents_dir():
+    return state_home() / "omarchy" / "agents" / "usage"
+
+
+def ensure_dirs():
+    sd = state_dir()
+    sd.mkdir(parents=True, exist_ok=True)
+    os.chmod(sd, 0o700)
+    cache_dir().mkdir(parents=True, exist_ok=True)
+    agents_dir().mkdir(parents=True, exist_ok=True)
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def rfc3339(d):
+    return f"{d.isoformat()}T00:00:00Z"
+
+
+def epoch(d):
+    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
+
+
+def month_start(today):
+    return today.replace(day=1)
+
+
+def prev_month(today):
+    ms = month_start(today) - timedelta(days=1)
+    return f"{ms.year:04d}-{ms.month:02d}"
+
+
+def human_date(ymd):
+    try:
+        y, m, d = (int(p) for p in ymd.split("-"))
+        return f"{MONTHS[m - 1]} {d}"
+    except (AttributeError, ValueError, IndexError):
+        return str(ymd)
+
+
+def sanitize(s):
+    if s is None:
+        return None
+    s = str(s)
+    # C0/DEL plus every other control (Cc: C1) and format (Cf: bidi overrides, ZWJ, …) character
+    s = "".join(ch for ch in s
+                if ch >= " " and ch != "\x7f" and unicodedata.category(ch) not in ("Cc", "Cf"))
+    s = s.replace("<", "‹").replace(">", "›")
+    return s[:200]
+
+
+def q2(d):
+    return d.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def fmt_money(d):
+    return str(q2(d))
+
+
+def dec(x):
+    if isinstance(x, Decimal):
+        return x
+    if isinstance(x, bool):
+        raise InvalidOperation("boolean is not an amount")
+    if isinstance(x, int):
+        return Decimal(x)
+    return Decimal(str(x))
+
+
+def jload(body):
+    return json.loads(body.decode("utf-8", "replace"), parse_float=Decimal)
+
+
+def jload_dict(body):
+    obj = jload(body)
+    if not isinstance(obj, dict):
+        raise FetchError("http", "unexpected response shape")
+    return obj
+
+
+def atomic_write_json(path, obj, secret=False):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
+    try:
+        # mkstemp files are already 0600; secrets must never widen
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        if secret:
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path):
+    p = Path(path)
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+# ---------- config / secrets ----------
+
+def default_config():
+    return {
+        "refreshIntervalSec": 300,
+        "thresholds": {"lowPercent": 0.20, "lowUsd": "10", "criticalPercent": 0.05, "criticalUsd": "3"},
+        "providers": {
+            "openrouter": {"enabled": True},
+            "vercel-ai": {"enabled": True},
+            "elevenlabs": {"enabled": True, "baseUrl": "https://api.elevenlabs.io"},
+            "openai-api": {"enabled": True, "ledger": {"entries": []}},
+            "anthropic-api": {"enabled": True, "amounts_are_cents": True, "ledger": {"entries": []}},
+        },
+    }
+
+
+def config_path():
+    return state_dir() / "config.json"
+
+
+def _config_value_error(merged):
+    """Return a message naming the offending key when a merged config value is unusable, else None."""
+    t = merged["thresholds"]
+    for k in ("lowPercent", "criticalPercent"):
+        try:
+            v = float(t[k])
+        except (TypeError, ValueError):
+            v = -1.0
+        if not (0 < v <= 1):
+            return f"thresholds.{k} must be a number in (0, 1]"
+    for k in ("lowUsd", "criticalUsd"):
+        try:
+            v = dec(t[k])
+        except (InvalidOperation, TypeError, ValueError):
+            v = None
+        if v is None or not v.is_finite() or v < 0:
+            return f"thresholds.{k} must be a non-negative decimal amount"
+    for pid, pcfg in merged["providers"].items():
+        loc = f"providers.{pid}"
+        if not isinstance(pcfg.get("enabled", True), bool):
+            return f"{loc}.enabled must be true or false"
+        if "amounts_are_cents" in pcfg and not isinstance(pcfg["amounts_are_cents"], bool):
+            return f"{loc}.amounts_are_cents must be true or false"
+        if "baseUrl" in pcfg and not isinstance(pcfg["baseUrl"], str):
+            return f"{loc}.baseUrl must be a string"
+        if "ledger" in pcfg:
+            ledger = pcfg["ledger"]
+            if not isinstance(ledger, dict):
+                return f"{loc}.ledger must be an object"
+            entries = ledger.get("entries")
+            if entries is None:
+                entries = []
+            if not isinstance(entries, list):
+                return f"{loc}.ledger.entries must be a list"
+            for i, e in enumerate(entries):
+                eloc = f"{loc}.ledger.entries[{i}]"
+                if not isinstance(e, dict):
+                    return f"{eloc} must be an object"
+                try:
+                    date.fromisoformat(str(e["date"]))
+                except (KeyError, TypeError, ValueError):
+                    return f"{eloc}.date must be YYYY-MM-DD"
+                try:
+                    amount = dec(e["amount"])
+                except (KeyError, InvalidOperation, TypeError, ValueError):
+                    amount = None
+                if amount is None or not amount.is_finite():
+                    return f"{eloc}.amount must be a decimal amount"
+    return None
+
+
+def load_config():
+    d = default_config()
+    p = config_path()
+    if not p.exists():
+        return d, None
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("config.json is not a JSON object")
+    except (OSError, ValueError) as e:
+        return None, str(e)
+    rt = raw.get("thresholds")
+    if rt is not None and not isinstance(rt, dict):
+        return None, "thresholds must be an object"
+    rp = raw.get("providers")
+    if rp is not None and not isinstance(rp, dict):
+        return None, "providers must be an object"
+    for pid in PROVIDERS:
+        entry = (rp or {}).get(pid)
+        if entry is not None and not isinstance(entry, dict):
+            return None, f"providers.{pid} must be an object"
+    merged = {
+        "refreshIntervalSec": raw.get("refreshIntervalSec", d["refreshIntervalSec"]),
+        "thresholds": {**d["thresholds"], **(rt or {})},
+        "providers": {},
+    }
+    for pid in PROVIDERS:
+        merged["providers"][pid] = {**d["providers"][pid], **((rp or {}).get(pid) or {})}
+    try:
+        merged["refreshIntervalSec"] = max(30, int(merged["refreshIntervalSec"]))
+    except (TypeError, ValueError):
+        merged["refreshIntervalSec"] = d["refreshIntervalSec"]
+    err = _config_value_error(merged)
+    if err is not None:
+        return None, err
+    return merged, None
+
+
+def load_raw_config():
+    p = config_path()
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        print("error: config.json is unreadable or malformed", file=sys.stderr)
+        sys.exit(2)
+
+
+def save_config(raw):
+    ensure_dirs()
+    atomic_write_json(config_path(), raw)
+
+
+def parse_thresholds(cfg):
+    t = cfg["thresholds"]
+    return {
+        "lowPercent": float(t["lowPercent"]),
+        "lowUsd": dec(t["lowUsd"]),
+        "criticalPercent": float(t["criticalPercent"]),
+        "criticalUsd": dec(t["criticalUsd"]),
+    }
+
+
+def secrets_path():
+    return state_dir() / "secrets.json"
+
+
+def load_secrets():
+    p = secrets_path()
+    if not p.exists():
+        return {}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            raise ValueError("secrets.json is not a JSON object")
+        return obj
+    except (OSError, ValueError) as e:
+        print(f"error: secrets.json unreadable: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def save_secrets(secrets):
+    ensure_dirs()
+    atomic_write_json(secrets_path(), secrets, secret=True)
+    os.chmod(secrets_path(), 0o600)
+
+
+# ---------- HTTP ----------
+
+class FetchError(Exception):
+    def __init__(self, kind, message, hint=None):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.hint = hint
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def http_get(url, headers):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **headers})
+    try:
+        with _OPENER.open(req, timeout=TIMEOUT) as r:
+            body = r.read(BODY_CAP + 1)
+            status = r.status
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(BODY_CAP + 1)
+        except OSError:
+            body = b""
+        status = e.code
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        reason = getattr(e, "reason", None) or e
+        raise FetchError("network", f"network error: {reason}") from e
+    if len(body) > BODY_CAP:
+        raise FetchError("http", "response body exceeds 2 MiB")
+    return status, body
+
+
+def extract_error_message(body):
+    try:
+        obj = json.loads(body.decode("utf-8", "replace"))
+    except (ValueError, AttributeError):
+        return body.decode("utf-8", "replace")[:200]
+    for probe in (
+        lambda o: o["error"]["message"],
+        lambda o: o["detail"]["message"],
+        lambda o: o["error"],
+        lambda o: o["detail"],
+        lambda o: o["message"],
+    ):
+        try:
+            v = probe(obj)
+            if isinstance(v, str) and v:
+                return v
+        except (KeyError, TypeError):
+            continue
+    return json.dumps(obj)[:200]
+
+
+def raise_http(status, body):
+    msg = sanitize(extract_error_message(body)) or f"HTTP {status}"
+    kind = "auth" if status in (401, 403) else "http"
+    raise FetchError(kind, f"HTTP {status}: {msg}")
+
+
+# ---------- fetchers ----------
+
+def fetch_openrouter(key, pcfg, http):
+    status, body = http("https://openrouter.ai/api/v1/credits", {"Authorization": f"Bearer {key}"})
+    if status == 200:
+        try:
+            d = jload_dict(body).get("data") or {}
+            total = dec(d.get("total_credits", 0))
+            used = dec(d.get("total_usage", 0))
+        except (ValueError, TypeError, InvalidOperation, AttributeError) as e:
+            raise FetchError("http", f"unexpected /credits response: {e}") from e
+        return {
+            "source": "credits", "remaining": total - used, "funded": total, "spent": used,
+            "currency": "USD", "estimated": False, "resetsAt": None, "ledgerSince": None,
+            "tierLabel": "Prepaid", "clamped": False,
+        }
+    if status == 403:
+        status2, body2 = http("https://openrouter.ai/api/v1/key", {"Authorization": f"Bearer {key}"})
+        if status2 == 200:
+            try:
+                d = jload_dict(body2).get("data") or {}
+                lr = d.get("limit_remaining")
+                limit = d.get("limit")
+                spent = dec(d.get("usage_monthly", 0))
+            except (ValueError, TypeError, InvalidOperation, AttributeError) as e:
+                raise FetchError("http", f"unexpected /key response: {e}") from e
+            if lr is None:
+                raise FetchError(
+                    "auth",
+                    "account credits need a Management key, and this key has no per-key spend limit",
+                    "Use a Management key, or set a spend limit on this key so limit_remaining is reported",
+                )
+            return {
+                "source": "key-limit", "remaining": dec(lr),
+                "funded": dec(limit) if limit is not None else None, "spent": spent,
+                "currency": "USD", "estimated": False, "resetsAt": None, "ledgerSince": None,
+                "tierLabel": "Key limit", "clamped": False,
+            }
+        raise_http(status2, body2)
+    raise_http(status, body)
+
+
+def fetch_vercel(key, pcfg, http):
+    status, body = http("https://ai-gateway.vercel.sh/v1/credits", {"Authorization": f"Bearer {key}"})
+    if status != 200:
+        raise_http(status, body)
+    try:
+        obj = jload_dict(body)
+        # balance/total_used arrive as USD strings
+        remaining = dec(obj["balance"])
+        spent = dec(obj["total_used"])
+    except (KeyError, ValueError, TypeError, InvalidOperation, AttributeError) as e:
+        raise FetchError("http", f"unexpected /v1/credits response: {e}") from e
+    return {
+        "source": "credits", "remaining": remaining, "funded": remaining + spent, "spent": spent,
+        "currency": "USD", "estimated": False, "resetsAt": None, "ledgerSince": None,
+        "tierLabel": "AI Gateway", "clamped": False,
+    }
+
+
+def check_base_url(base):
+    # https only, except loopback for tests/mocks
+    parts = urllib.parse.urlsplit(base)
+    ok = parts.scheme == "https" or (
+        parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1"))
+    if not ok:
+        raise FetchError("config", f"baseUrl must use https: {base}",
+                         "Fix providers.elevenlabs.baseUrl in config.json")
+
+
+def fetch_elevenlabs(key, pcfg, http):
+    base = (pcfg.get("baseUrl") or "https://api.elevenlabs.io").rstrip("/")
+    check_base_url(base)
+    status, body = http(base + "/v1/user/subscription", {"xi-api-key": key})
+    if status != 200:
+        raise_http(status, body)
+    try:
+        obj = jload_dict(body)
+        limit = int(obj["character_limit"])
+        count = int(obj["character_count"])
+        reset = obj.get("next_character_count_reset_unix")
+        resets_at = iso(datetime.fromtimestamp(int(reset), tz=timezone.utc)) if reset else None
+    except (KeyError, ValueError, TypeError, AttributeError) as e:
+        raise FetchError("http", f"unexpected subscription response: {e}") from e
+    tier = sanitize(obj.get("tier")) or "Subscription"
+    return {
+        "source": "subscription", "remaining": Decimal(limit - count), "funded": Decimal(limit),
+        "spent": Decimal(count), "currency": "credits", "estimated": False,
+        "resetsAt": resets_at, "ledgerSince": None, "tierLabel": tier, "clamped": False,
+    }
+
+
+def ledger_entries(pcfg):
+    return (pcfg.get("ledger") or {}).get("entries") or []
+
+
+def ledger_funded_since(entries):
+    funded = Decimal("0")
+    since = None
+    for e in entries:
+        try:
+            amount = dec(e["amount"])
+            d = date.fromisoformat(e["date"])
+        except (KeyError, TypeError, ValueError, InvalidOperation) as err:
+            raise FetchError("config", f"invalid ledger entry: {err}",
+                             "Fix ledger.entries in config.json (date YYYY-MM-DD, amount decimal string)") from err
+        funded += amount
+        since = d if since is None or d < since else since
+    return funded, since
+
+
+def ledger_hash(entries):
+    canon = json.dumps(
+        [{"date": str(e.get("date")), "amount": str(e.get("amount"))} for e in entries],
+        sort_keys=True,
+    )
+    return hashlib.sha256(canon.encode()).hexdigest()
+
+
+def fetch_openai_costs(key, http, start, end, pcfg):
+    total = Decimal("0")
+    page = None
+    while True:
+        params = {"start_time": str(epoch(start)), "bucket_width": "1d", "limit": "180"}
+        if end is not None:
+            params["end_time"] = str(epoch(end))
+        if page:
+            params["page"] = page
+        url = "https://api.openai.com/v1/organization/costs?" + urllib.parse.urlencode(params)
+        status, body = http(url, {"Authorization": f"Bearer {key}"})
+        if status != 200:
+            raise_http(status, body)
+        try:
+            obj = jload_dict(body)
+            for bucket in obj.get("data") or []:
+                for res in bucket.get("results") or []:
+                    value = (res.get("amount") or {}).get("value")
+                    if value is not None:
+                        total += dec(value)
+        except (ValueError, TypeError, InvalidOperation, AttributeError) as e:
+            raise FetchError("http", f"unexpected costs response: {e}") from e
+        if obj.get("has_more") and obj.get("next_page"):
+            page = obj["next_page"]
+        else:
+            return total
+
+
+def _anthropic_window(key, http, start, end):
+    total = Decimal("0")
+    page = None
+    while True:
+        params = {
+            "starting_at": rfc3339(start), "ending_at": rfc3339(end),
+            "bucket_width": "1d", "limit": "31",
+        }
+        if page:
+            params["page"] = page
+        url = "https://api.anthropic.com/v1/organizations/cost_report?" + urllib.parse.urlencode(params)
+        status, body = http(url, {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION})
+        if status != 200:
+            raise_http(status, body)
+        try:
+            obj = jload_dict(body)
+            for bucket in obj.get("data") or []:
+                for res in bucket.get("results") or []:
+                    amount = res.get("amount")
+                    if amount is not None:
+                        total += dec(amount)
+        except (ValueError, TypeError, InvalidOperation, AttributeError) as e:
+            raise FetchError("http", f"unexpected cost_report response: {e}") from e
+        if obj.get("has_more") and obj.get("next_page"):
+            page = obj["next_page"]
+        else:
+            return total
+
+
+def fetch_anthropic_costs(key, http, start, end, pcfg):
+    if end is None:
+        end = utcnow().date() + timedelta(days=1)
+    total = Decimal("0")
+    s = start
+    while s < end:
+        # cost_report accepts at most 31 daily buckets per request
+        e = min(s + timedelta(days=31), end)
+        total += _anthropic_window(key, http, s, e)
+        s = e
+    if pcfg.get("amounts_are_cents", True):
+        total = total / 100
+    return total
+
+
+COST_FETCHERS = {"openai-api": fetch_openai_costs, "anthropic-api": fetch_anthropic_costs}
+
+
+def fetch_ledger_provider(pid, key, pcfg, http, cache, today):
+    entries = ledger_entries(pcfg)
+    if not entries:
+        raise FetchError(
+            "config", "no ledger entries configured",
+            f"Run: {INVOKE} ledger set {pid} --funded <usd> --since <YYYY-MM-DD>",
+        )
+    funded, since = ledger_funded_since(entries)
+    lhash = ledger_hash(entries)
+    ms = month_start(today)
+    pm = prev_month(today)
+    fetch_costs = COST_FETCHERS[pid]
+
+    cp = cache.get("checkpoint")
+    if not (isinstance(cp, dict) and cp.get("ledgerHash") == lhash and cp.get("throughMonth") == pm):
+        prev_spent = fetch_costs(key, http, since, ms, pcfg) if since < ms else Decimal("0")
+        cp = {"throughMonth": pm, "spent": str(prev_spent), "ledgerHash": lhash}
+    cache["checkpoint"] = cp
+
+    cur_start = since if since > ms else ms
+    cur_spent = fetch_costs(key, http, cur_start, today + timedelta(days=1), pcfg)
+    spent = Decimal(cp["spent"]) + cur_spent
+
+    if pid == "anthropic-api" and funded > 0 and spent > funded * 50:
+        raise FetchError(
+            "unit-suspect", "reported spend exceeds 50x funded — cost units look wrong",
+            f"Run: {INVOKE} doctor and confirm amounts_are_cents against the console",
+        )
+
+    pre = funded - spent
+    clamped = pre < 0
+    return {
+        "source": "ledger", "remaining": Decimal("0") if clamped else pre, "funded": funded,
+        "spent": spent, "currency": "USD", "estimated": True, "resetsAt": None,
+        "ledgerSince": since.isoformat(), "tierLabel": "Prepaid (est.)",
+        "clamped": clamped, "preClampRemaining": pre,
+    }
+
+
+def fetch_provider(pid, key, pcfg, http, cache, today):
+    if pid == "openrouter":
+        return fetch_openrouter(key, pcfg, http)
+    if pid == "vercel-ai":
+        return fetch_vercel(key, pcfg, http)
+    if pid == "elevenlabs":
+        return fetch_elevenlabs(key, pcfg, http)
+    return fetch_ledger_provider(pid, key, pcfg, http, cache, today)
+
+
+# ---------- rendering: snapshot rows and agents records ----------
+
+def severity_of(remaining, percent, currency, th):
+    if remaining is None:
+        return "unknown"
+    money = currency == "USD"
+    if (percent is not None and percent < th["criticalPercent"]) or (money and remaining < th["criticalUsd"]):
+        return "critical"
+    if (percent is not None and percent < th["lowPercent"]) or (money and remaining < th["lowUsd"]):
+        return "low"
+    return "ok"
+
+
+def _fm(norm):
+    if norm["currency"] == "credits":
+        return lambda d: str(int(d))
+    return fmt_money
+
+
+def detail_for(pid, norm):
+    fm = _fm(norm)
+    spent, funded = norm["spent"], norm["funded"]
+    if pid == "elevenlabs":
+        return f"{int(spent):,} of {int(funded):,} credits used"
+    if norm["source"] == "ledger":
+        d = f"≈ ${fm(spent)} used of ${fm(funded)} since {norm['ledgerSince']}"
+        if norm.get("clamped"):
+            d += " · ledger out of date?"
+        return d
+    if norm["source"] == "key-limit":
+        if funded is None:
+            return f"${fm(spent)} used this month"
+        return f"${fm(spent)} used this month of ${fm(funded)} key limit"
+    return f"${fm(spent)} used of ${fm(funded)}"
+
+
+def usage_text_for(pid, norm):
+    fm = _fm(norm)
+    if pid == "openrouter":
+        return f"${fm(norm['remaining'])} remaining · ${fm(norm['spent'])} used"
+    if pid == "vercel-ai":
+        return f"${fm(norm['remaining'])} remaining"
+    if pid == "elevenlabs":
+        return f"{int(norm['remaining']):,} of {int(norm['funded']):,} credits"
+    return f"≈ ${fm(norm['remaining'])} remaining since {human_date(norm['ledgerSince'])}"
+
+
+def percent_remaining(norm):
+    funded = norm["funded"]
+    if funded is None or funded <= 0:
+        return None
+    p = round(float(norm["remaining"] / funded), 4)
+    return min(max(p, 0.0), 1.0)
+
+
+def build_row(pid, norm, fetched_iso, th):
+    fm = _fm(norm)
+    percent = percent_remaining(norm)
+    balance = {
+        "remaining": fm(norm["remaining"]),
+        "funded": fm(norm["funded"]) if norm["funded"] is not None else None,
+        "spent": fm(norm["spent"]),
+        "currency": norm["currency"],
+        "estimated": bool(norm["estimated"]),
+    }
+    return {
+        "id": pid,
+        "name": NAMES[pid],
+        "status": "ok",
+        "source": norm["source"],
+        "balance": balance,
+        "percentRemaining": percent,
+        "severity": severity_of(norm["remaining"], percent, norm["currency"], th),
+        "resetsAt": norm.get("resetsAt"),
+        "ledgerSince": norm.get("ledgerSince"),
+        "detail": sanitize(detail_for(pid, norm)),
+        "fetchedAt": fetched_iso,
+        "stale": False,
+        "error": None,
+        "hint": None,
+    }
+
+
+def _zero_counts():
+    return {"todayPrompts": 0, "todaySessions": 0, "totalPrompts": 0, "totalSessions": 0, "activeDays": 0}
+
+
+def build_record(pid, norm, fetched_iso):
+    rec = {
+        "schemaVersion": 1,
+        "id": pid,
+        "name": NAMES[pid],
+        "updatedAt": fetched_iso,
+        "ready": True,
+        "scope": "account",
+        "tierLabel": sanitize(norm["tierLabel"]),
+        "usageStatusText": sanitize(usage_text_for(pid, norm)),
+        "limits": [],
+        **_zero_counts(),
+    }
+    if pid == "elevenlabs":
+        funded = norm["funded"]
+        used_pct = round(float(norm["spent"] / funded), 4) if funded and funded > 0 else 0.0
+        rec["limits"] = [{
+            "label": "Credits",
+            "title": "Credits",
+            "percent": min(max(used_pct, 0.0), 1.0),
+            "resetsAt": norm.get("resetsAt"),
+        }]
+    else:
+        # agents records carry money as JSON numbers (the panel divides remaining/funded)
+        rec["balance"] = {
+            "remaining": float(q2(norm["remaining"])),
+            "funded": float(q2(norm["funded"])) if norm["funded"] is not None else None,
+            "spent": float(q2(norm["spent"])),
+            "currency": "USD",
+            "estimated": bool(norm["estimated"]),
+        }
+    return rec
+
+
+def error_row(pid, err, attempt_iso):
+    return {
+        "id": pid,
+        "name": NAMES[pid],
+        "status": "error",
+        "source": None,
+        "balance": None,
+        "percentRemaining": None,
+        "severity": "unknown",
+        "resetsAt": None,
+        "ledgerSince": None,
+        "detail": None,
+        "fetchedAt": attempt_iso,
+        "stale": False,
+        "error": {
+            "kind": err.get("kind") or "http",
+            "message": sanitize(err.get("message")) or "unknown error",
+            "hint": sanitize(err.get("hint")),
+        },
+        "hint": None,
+    }
+
+
+def error_record(pid, err, now_iso):
+    return {
+        "schemaVersion": 1,
+        "id": pid,
+        "name": NAMES[pid],
+        "updatedAt": now_iso,
+        "ready": False,
+        "scope": "account",
+        "tierLabel": None,
+        "usageStatusText": sanitize(err.get("message")) or "unavailable",
+        "authHelpText": sanitize(err.get("hint")) or f"Run: {INVOKE} doctor",
+        "limits": [],
+        **_zero_counts(),
+    }
+
+
+def unconfigured_row(pid):
+    return {
+        "id": pid,
+        "name": NAMES[pid],
+        "status": "unconfigured",
+        "source": None,
+        "balance": None,
+        "percentRemaining": None,
+        "severity": "unknown",
+        "resetsAt": None,
+        "ledgerSince": None,
+        "detail": None,
+        "fetchedAt": None,
+        "stale": False,
+        "error": None,
+        "hint": f"Run: {INVOKE} key set {pid}",
+    }
+
+
+def build_snapshot(rows, now):
+    total = Decimal("0")
+    any_estimated = False
+    for r in rows:
+        b = r.get("balance")
+        if r["status"] == "ok" and b and b["currency"] == "USD" and b["remaining"] is not None:
+            total += Decimal(b["remaining"])
+            if b["estimated"]:
+                any_estimated = True
+    rank = {"critical": 0, "low": 1}
+    candidates = [r for r in rows if r["severity"] in rank]
+    attention = None
+    if candidates:
+        candidates.sort(key=lambda r: (
+            rank[r["severity"]],
+            r["percentRemaining"] if r["percentRemaining"] is not None else 2.0,
+        ))
+        attention = candidates[0]["id"]
+    return {
+        "schemaVersion": 1,
+        "generatedAt": iso(now),
+        "totalRemainingUsd": fmt_money(total),
+        "anyEstimated": any_estimated,
+        "attention": attention,
+        "providers": rows,
+    }
+
+
+# ---------- cache / lock / sync ----------
+
+def cache_path(pid):
+    return cache_dir() / f"{pid}.json"
+
+
+def load_cache(pid):
+    try:
+        obj = read_json(cache_path(pid))
+        return obj if isinstance(obj, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cache(pid, cache):
+    atomic_write_json(cache_path(pid), cache)
+
+
+def compute_due(cache, now, ttl):
+    last = parse_iso(cache.get("lastAttempt"))
+    if last is None:
+        return True
+    fails = int(cache.get("failCount") or 0)
+    interval = ttl if fails == 0 else min(ttl * (2 ** min(fails, 4)), max(BACKOFF_CAP, ttl))
+    return (now - last).total_seconds() >= interval
+
+
+def row_from_cache(pid, cache, now):
+    lg = cache.get("lastGood")
+    le = cache.get("lastError")
+    attempt = cache.get("lastAttempt")
+    if isinstance(lg, dict) and lg.get("row"):
+        row = json.loads(json.dumps(lg["row"]))
+        rec = json.loads(json.dumps(lg["record"])) if lg.get("record") else None
+        if le:
+            fetched = parse_iso(lg.get("fetchedAt"))
+            if fetched and (now - fetched) <= STALE_MAX:
+                row["stale"] = True
+                row["error"] = le
+                # auth/config failures need the user to act: record flips to ready:false
+                # even while last-good data is still fresh; other kinds keep the cached
+                # record unchanged (updatedAt stays at the data's fetch time)
+                if (le.get("kind") or "") in ("auth", "config"):
+                    rec = error_record(pid, le, iso(now))
+                return row, rec
+            expired = {"kind": "stale-expired",
+                       "message": "no successful fetch in over 7 days",
+                       "hint": (le or {}).get("hint")}
+            return error_row(pid, expired, attempt), error_record(pid, expired, iso(now))
+        return row, rec
+    if le:
+        return error_row(pid, le, attempt), error_record(pid, le, iso(now))
+    never = {"kind": "network", "message": "no data yet", "hint": None}
+    return error_row(pid, never, attempt), error_record(pid, never, iso(now))
+
+
+def write_record(pid, rec):
+    if rec.get("id") != pid:
+        raise AssertionError(f"record id {rec.get('id')!r} != filename stem {pid!r}")
+    path = agents_dir() / f"{pid}.json"
+    if path.stem != rec["id"]:
+        raise AssertionError("record id does not match filename stem")
+    atomic_write_json(path, rec)
+
+
+def notify(pid, severity):
+    urgency = "critical" if severity == "critical" else "normal"
+    # argv carries only fixed strings and our own provider display name
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "omarchy-balances", "-u", urgency,
+             "AI balances", f"{NAMES[pid]}: balance {severity}"],
+            check=False, timeout=5,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def process_alerts(rows):
+    path = state_dir() / "alerts.json"
+    try:
+        prev = read_json(path) or {}
+        if not isinstance(prev, dict):
+            prev = {}
+    except (OSError, ValueError):
+        prev = {}
+    order = {"low": 1, "critical": 2}
+    cur = {}
+    for r in rows:
+        sev = r["severity"]
+        pid = r["id"]
+        if sev in order:
+            cur[pid] = sev
+            if order[sev] > order.get(prev.get(pid), 0):
+                notify(pid, sev)
+        elif sev == "unknown" and pid in prev:
+            cur[pid] = prev[pid]
+        # severity "ok" drops the entry: recovery re-arms notification
+    atomic_write_json(path, cur)
+
+
+def acquire_lock():
+    ensure_dirs()
+    fh = open(state_dir() / "lock", "a")
+    deadline = time.monotonic() + LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                return None
+            time.sleep(0.25)
+
+
+def snapshot_path():
+    return state_dir() / "snapshot.json"
+
+
+def exit_code_for(rows):
+    configured = [r for r in rows if r["status"] != "unconfigured"]
+    if configured and not any(r["status"] == "ok" for r in configured):
+        return 1
+    return 0
+
+
+def clear_provider_state(pid):
+    for p in (cache_path(pid), agents_dir() / f"{pid}.json"):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _config_error_exit(message, hint):
+    now = utcnow()
+    err = {"kind": "config", "message": message, "hint": hint}
+    rows = [error_row(pid, err, iso(now)) for pid in PROVIDERS]
+    snap = build_snapshot(rows, now)
+    atomic_write_json(snapshot_path(), snap)
+    print(json.dumps(snap, indent=2))
+    return 2
+
+
+def cmd_sync(args):
+    try:
+        return _cmd_sync(args)
+    except Exception as e:  # noqa: BLE001 — sync must never traceback; degrade to a config snapshot
+        try:
+            return _config_error_exit(f"internal error: {type(e).__name__}: {e}",
+                                      f"Run: {INVOKE} doctor")
+        except Exception:  # noqa: BLE001 — even the snapshot write failed
+            return 2
+
+
+def _cmd_sync(args):
+    ensure_dirs()
+    cfg, cfg_err = load_config()
+    if cfg_err is not None:
+        return _config_error_exit(f"config.json is malformed: {cfg_err}", "Fix or delete config.json")
+    now = utcnow()
+
+    secrets = load_secrets()
+    th = parse_thresholds(cfg)
+    ttl = cfg["refreshIntervalSec"]
+
+    lock = acquire_lock()
+    if lock is None:
+        snap = None
+        try:
+            snap = read_json(snapshot_path())
+        except (OSError, ValueError):
+            pass
+        if snap is None:
+            snap = build_snapshot([], now)
+        print(json.dumps(snap, indent=2))
+        return exit_code_for(snap.get("providers") or [])
+
+    try:
+        rows = []
+        records = {}
+        today = now.date()
+        for pid in PROVIDERS:
+            pcfg = cfg["providers"][pid]
+            if not pcfg.get("enabled", True):
+                clear_provider_state(pid)
+                continue
+            key = secrets.get(pid)
+            if not key:
+                clear_provider_state(pid)
+                rows.append(unconfigured_row(pid))
+                continue
+            cache = load_cache(pid)
+            due = compute_due(cache, now, ttl)
+            if args.force:
+                due = True
+            if args.provider and pid != args.provider:
+                due = False
+            if due:
+                try:
+                    norm = fetch_provider(pid, key, pcfg, http_get, cache, today)
+                    fetched = iso(utcnow())
+                    row = build_row(pid, norm, fetched, th)
+                    rec = build_record(pid, norm, fetched)
+                    cache.update({
+                        "lastAttempt": iso(now), "failCount": 0, "lastError": None,
+                        "lastGood": {"fetchedAt": fetched, "row": row, "record": rec},
+                    })
+                except FetchError as e:
+                    cache["lastAttempt"] = iso(now)
+                    cache["failCount"] = int(cache.get("failCount") or 0) + 1
+                    cache["lastError"] = {"kind": e.kind, "message": sanitize(e.message),
+                                          "hint": sanitize(e.hint)}
+                    row, rec = row_from_cache(pid, cache, now)
+                save_cache(pid, cache)
+            else:
+                row, rec = row_from_cache(pid, cache, now)
+            rows.append(row)
+            if rec is not None:
+                records[pid] = rec
+
+        snap = build_snapshot(rows, now)
+        atomic_write_json(snapshot_path(), snap)
+        for pid, rec in records.items():
+            write_record(pid, rec)
+        process_alerts(rows)
+        print(json.dumps(snap, indent=2))
+        return exit_code_for(rows)
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock.close()
+
+
+# ---------- other commands ----------
+
+def cmd_status(args):
+    p = snapshot_path()
+    if p.exists():
+        sys.stdout.write(p.read_text(encoding="utf-8"))
+        return 0
+    print(json.dumps({
+        "schemaVersion": 1,
+        "generatedAt": None,
+        "totalRemainingUsd": "0.00",
+        "anyEstimated": False,
+        "attention": None,
+        "providers": [],
+    }, indent=2))
+    return 0
+
+
+def read_key_input(prompt):
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt).strip()
+    return sys.stdin.read().strip()
+
+
+def cmd_key(args):
+    if args.action == "list":
+        secrets = load_secrets()
+        print(json.dumps({pid: bool(secrets.get(pid)) for pid in PROVIDERS}, indent=2))
+        return 0
+    pid = args.provider
+    secrets = load_secrets()
+    if args.action == "set":
+        key = read_key_input(f"{NAMES[pid]} API key: ")
+        if not key:
+            print("error: empty key", file=sys.stderr)
+            return 1
+        secrets[pid] = key
+        save_secrets(secrets)
+        try:
+            cache_path(pid).unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"key stored for {pid}")
+        return 0
+    if args.action == "clear":
+        secrets.pop(pid, None)
+        save_secrets(secrets)
+        clear_provider_state(pid)
+        print(f"key cleared for {pid}")
+        return 0
+    return 1
+
+
+def _set_ledger_entries(pid, entries):
+    raw = load_raw_config()
+    raw.setdefault("providers", {}).setdefault(pid, {}).setdefault("ledger", {})["entries"] = entries
+    save_config(raw)
+    cache = load_cache(pid)
+    if cache:
+        cache["failCount"] = 0
+        cache["lastError"] = None
+        cache.pop("lastAttempt", None)
+        save_cache(pid, cache)
+
+
+def cmd_ledger(args):
+    if args.action == "show":
+        cfg, cfg_err = load_config()
+        if cfg_err is not None:
+            print("error: config.json is malformed", file=sys.stderr)
+            return 2
+        out = {}
+        for pid in LEDGER_PROVIDERS:
+            entries = ledger_entries(cfg["providers"][pid])
+            info = {"entries": entries}
+            if entries:
+                try:
+                    funded, since = ledger_funded_since(entries)
+                    info["funded"] = fmt_money(funded)
+                    info["since"] = since.isoformat()
+                except FetchError as e:
+                    info["error"] = e.message
+            out[pid] = info
+        print(json.dumps(out, indent=2))
+        return 0
+    pid = args.provider
+    if args.action == "set":
+        try:
+            funded = dec(args.funded)
+            since = date.fromisoformat(args.since)
+        except (InvalidOperation, ValueError):
+            print("error: --funded must be a decimal amount, --since must be YYYY-MM-DD", file=sys.stderr)
+            return 1
+        _set_ledger_entries(pid, [{"date": since.isoformat(), "amount": fmt_money(funded)}])
+        print(f"ledger for {pid}: funded ${fmt_money(funded)} since {since.isoformat()}")
+        return 0
+    if args.action == "add":
+        try:
+            amount = dec(args.amount)
+            d = date.fromisoformat(args.date) if args.date else utcnow().date()
+        except (InvalidOperation, ValueError):
+            print("error: --amount must be a decimal amount, --date must be YYYY-MM-DD", file=sys.stderr)
+            return 1
+        cfg, cfg_err = load_config()
+        if cfg_err is not None:
+            print("error: config.json is malformed", file=sys.stderr)
+            return 2
+        entries = list(ledger_entries(cfg["providers"][pid]))
+        entries.append({"date": d.isoformat(), "amount": fmt_money(amount)})
+        _set_ledger_entries(pid, entries)
+        funded, since = ledger_funded_since(entries)
+        print(f"ledger for {pid}: funded ${fmt_money(funded)} since {since.isoformat()}")
+        return 0
+    return 1
+
+
+def anthropic_first_raw(key, http):
+    today = utcnow().date()
+    start = today - timedelta(days=30)
+    page = None
+    while True:
+        params = {
+            "starting_at": rfc3339(start), "ending_at": rfc3339(today + timedelta(days=1)),
+            "bucket_width": "1d", "limit": "31",
+        }
+        if page:
+            params["page"] = page
+        url = "https://api.anthropic.com/v1/organizations/cost_report?" + urllib.parse.urlencode(params)
+        status, body = http(url, {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION})
+        if status != 200:
+            raise_http(status, body)
+        obj = jload_dict(body)
+        try:
+            for bucket in obj.get("data") or []:
+                for res in bucket.get("results") or []:
+                    if res.get("amount") is not None:
+                        return str(res["amount"])
+        except AttributeError as e:
+            raise FetchError("http", f"unexpected cost_report response: {e}") from e
+        if obj.get("has_more") and obj.get("next_page"):
+            page = obj["next_page"]
+        else:
+            return None
+
+
+def confirm_cents(key, interactive):
+    raw = anthropic_first_raw(key, http_get)
+    if raw is None:
+        print("  no anthropic cost buckets in the last 30 days; keeping amounts_are_cents unchanged")
+        return
+    safe = sanitize(raw)
+    try:
+        amt = Decimal(raw)
+    except InvalidOperation:
+        print(f'  first bucket amount is not a decimal: "{safe}"')
+        return
+    raw_cfg = load_raw_config()
+    cur = ((raw_cfg.get("providers") or {}).get("anthropic-api") or {}).get("amounts_are_cents", True)
+    print(f'  raw first bucket amount: "{safe}"')
+    print(f"  interpreted as cents:   ${fmt_money(amt / 100)}")
+    print(f"  interpreted as dollars: ${fmt_money(amt)}")
+    print(f"  current config: amounts_are_cents = {json.dumps(bool(cur))}")
+    if interactive and sys.stdin.isatty():
+        ans = input("  which matches console.anthropic.com? [c]ents / [d]ollars / Enter=keep: ").strip().lower()
+        if ans[:1] in ("c", "d"):
+            raw_cfg.setdefault("providers", {}).setdefault("anthropic-api", {})["amounts_are_cents"] = (ans[0] == "c")
+            save_config(raw_cfg)
+            print(f"  saved amounts_are_cents = {json.dumps(ans[0] == 'c')}")
+    else:
+        print("  confirm against the console; adjust providers.anthropic-api.amounts_are_cents in config.json if wrong")
+
+
+def _doctor_one(pid, key, pcfg, today):
+    if pid in LEDGER_PROVIDERS and not ledger_entries(pcfg):
+        # validate the key with a 7-day cost probe even without a ledger
+        COST_FETCHERS[pid](key, http_get, today - timedelta(days=7), today + timedelta(days=1), pcfg)
+        return None, f"key OK, but no ledger entries — run: {INVOKE} ledger set {pid} --funded <usd> --since <date>"
+    norm = fetch_provider(pid, key, pcfg, http_get, {}, today)
+    return norm, None
+
+
+def cmd_doctor(args):
+    cfg, cfg_err = load_config()
+    if cfg_err is not None:
+        print(f"config.json: FAIL malformed: {cfg_err}")
+        return 1
+    secrets = load_secrets()
+    today = utcnow().date()
+    failed = False
+    for pid in PROVIDERS:
+        pcfg = cfg["providers"][pid]
+        if not pcfg.get("enabled", True):
+            print(f"{pid:<15} SKIP  disabled in config")
+            continue
+        key = os.environ.get(ENV_KEYS[pid]) or secrets.get(pid)
+        if not key:
+            print(f"{pid:<15} SKIP  no key (run: {INVOKE} key set {pid})")
+            continue
+        try:
+            norm, warn = _doctor_one(pid, key, pcfg, today)
+            if norm is None:
+                print(f"{pid:<15} OK    {warn}")
+            else:
+                fm = _fm(norm)
+                if norm["currency"] == "credits":
+                    summary = f"{int(norm['remaining']):,} credits remaining"
+                else:
+                    summary = f"${fm(norm['remaining'])} remaining"
+                print(f"{pid:<15} OK    {summary} [{norm['source']}] — {detail_for(pid, norm)}")
+                pre = norm.get("preClampRemaining")
+                if pre is not None and pre < 0:
+                    print(f"{'':<15} WARN  computed remaining is negative (${fmt_money(pre)}) — ledger out of date?")
+            if pid == "anthropic-api":
+                confirm_cents(key, interactive=True)
+        except FetchError as e:
+            failed = True
+            hint = f" — {e.hint}" if e.hint else ""
+            print(f"{pid:<15} FAIL  [{e.kind}] {sanitize(e.message)}{hint}")
+    return 1 if failed else 0
+
+
+def cmd_setup(args):
+    if not sys.stdin.isatty():
+        print("error: setup is interactive; run it in a terminal", file=sys.stderr)
+        return 1
+    ensure_dirs()
+    secrets = load_secrets()
+    today = utcnow().date()
+    print("omarchy-balances setup — keys are read hidden from the terminal and stored in secrets.json (0600)")
+    for pid in PROVIDERS:
+        name = NAMES[pid]
+        has = " (key already set)" if secrets.get(pid) else ""
+        ans = input(f"\nConfigure {name}{has}? [Y/n] ").strip().lower()
+        if ans.startswith("n"):
+            continue
+        key = getpass.getpass(f"{name} API key (hidden, Enter to skip): ").strip()
+        if not key:
+            print("  skipped")
+            continue
+        if pid in LEDGER_PROVIDERS:
+            cfg, cfg_err = load_config()
+            if cfg_err is not None:
+                print(f"error: config.json is invalid: {cfg_err}", file=sys.stderr)
+                return 2
+            if not ledger_entries(cfg["providers"][pid]):
+                print(f"  {name} has no balance API; a funding ledger is needed for the estimate.")
+                funded = input("  total funded so far (USD, e.g. 60.00): ").strip()
+                since = input("  since date (YYYY-MM-DD): ").strip()
+                try:
+                    _set_ledger_entries(pid, [{"date": date.fromisoformat(since).isoformat(),
+                                              "amount": fmt_money(dec(funded))}])
+                except (InvalidOperation, ValueError):
+                    print("  invalid funded/since — skipping this provider")
+                    continue
+        cfg, cfg_err = load_config()
+        if cfg_err is not None:
+            print(f"error: config.json is invalid: {cfg_err}", file=sys.stderr)
+            return 2
+        pcfg = cfg["providers"][pid]
+        try:
+            norm, warn = _doctor_one(pid, key, pcfg, today)
+            if norm is not None:
+                print(f"  live test OK: {usage_text_for(pid, norm)}")
+            else:
+                print(f"  live test OK ({warn})")
+            secrets[pid] = key
+            save_secrets(secrets)
+            try:
+                cache_path(pid).unlink(missing_ok=True)
+            except OSError:
+                pass
+            print("  key saved")
+            if pid == "anthropic-api":
+                confirm_cents(key, interactive=True)
+        except FetchError as e:
+            hint = f" — {e.hint}" if e.hint else ""
+            print(f"  live test FAILED [{e.kind}]: {sanitize(e.message)}{hint}")
+            print("  key NOT saved")
+    print("\nRunning initial sync...")
+    cmd_sync(argparse.Namespace(force=True, provider=None))
+    print(f"\nDone. Refresh any time with: {INVOKE} sync --force")
+    return 0
+
+
+def cmd_cleanup(args):
+    removed = []
+    for pid in PROVIDERS:
+        p = agents_dir() / f"{pid}.json"
+        if p.exists():
+            p.unlink()
+            removed.append(str(p))
+    sd = state_dir()
+    if sd.exists():
+        shutil.rmtree(sd)
+        removed.append(str(sd))
+    for path in removed:
+        print(f"removed {path}")
+    if not removed:
+        print("nothing to remove")
+    return 0
+
+
+# ---------- selftest ----------
+
+def run_selftest():
+    fixtures = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+    results = []
+
+    def t(name, fn):
+        try:
+            fn()
+            results.append((name, None))
+        except AssertionError as e:
+            results.append((name, str(e) or "assertion failed"))
+        except Exception as e:  # noqa: BLE001 — selftest must report, not crash
+            results.append((name, f"{type(e).__name__}: {e}"))
+
+    def fx(name):
+        return (fixtures / name).read_bytes()
+
+    th = parse_thresholds(default_config())
+
+    def http_of(mapping):
+        calls = []
+
+        def http(url, headers):
+            calls.append((url, headers))
+            for prefix, resp in mapping:
+                if url.startswith(prefix) or prefix in url:
+                    return resp() if callable(resp) else resp
+            raise AssertionError(f"unexpected url {url}")
+        http.calls = calls
+        return http
+
+    # -- openrouter credits mapping
+    def t_openrouter():
+        http = http_of([("https://openrouter.ai/api/v1/credits", (200, fx("openrouter-credits.json")))])
+        norm = fetch_openrouter("k", {}, http)
+        row = build_row("openrouter", norm, "2026-08-28T15:49:58Z", th)
+        assert row["balance"]["remaining"] == "23.40", row["balance"]
+        assert row["balance"]["funded"] == "120.00"
+        assert row["balance"]["spent"] == "96.60"
+        assert row["balance"]["currency"] == "USD"
+        assert row["balance"]["estimated"] is False
+        assert row["source"] == "credits"
+        assert row["percentRemaining"] == 0.195
+        assert row["severity"] == "low"
+        assert row["status"] == "ok" and row["stale"] is False and row["error"] is None
+    t("openrouter credits -> entry", t_openrouter)
+
+    # -- openrouter 403 fallback
+    def t_openrouter_fallback():
+        http = http_of([
+            ("https://openrouter.ai/api/v1/credits", (403, fx("openrouter-credits-403.json"))),
+            ("https://openrouter.ai/api/v1/key", (200, fx("openrouter-key.json"))),
+        ])
+        norm = fetch_openrouter("k", {}, http)
+        assert norm["source"] == "key-limit"
+        assert fmt_money(norm["remaining"]) == "23.40"
+        assert fmt_money(norm["spent"]) == "6.60"
+        assert fmt_money(norm["funded"]) == "30.00"
+        assert norm["tierLabel"] == "Key limit"
+        assert len(http.calls) == 2
+    t("openrouter 403 fallback -> key-limit", t_openrouter_fallback)
+
+    def t_openrouter_nolimit():
+        http = http_of([
+            ("https://openrouter.ai/api/v1/credits", (403, fx("openrouter-credits-403.json"))),
+            ("https://openrouter.ai/api/v1/key", (200, fx("openrouter-key-nolimit.json"))),
+        ])
+        try:
+            fetch_openrouter("k", {}, http)
+            raise AssertionError("expected FetchError")
+        except FetchError as e:
+            assert e.kind == "auth"
+            assert "Management key" in (e.hint or "") or "Management" in e.message
+    t("openrouter fallback null limit -> auth error with hint", t_openrouter_nolimit)
+
+    # -- vercel string decimals
+    def t_vercel():
+        http = http_of([("https://ai-gateway.vercel.sh/v1/credits", (200, fx("vercel-credits.json")))])
+        norm = fetch_vercel("k", {}, http)
+        assert norm["remaining"] == Decimal("95.50")
+        assert norm["spent"] == Decimal("4.50")
+        assert norm["funded"] == Decimal("100.00")
+        row = build_row("vercel-ai", norm, "2026-08-28T15:49:58Z", th)
+        assert row["balance"]["remaining"] == "95.50"
+        assert row["balance"]["funded"] == "100.00"
+        assert row["percentRemaining"] == 0.955
+        assert row["severity"] == "ok"
+    t("vercel-ai USD strings -> Decimal", t_vercel)
+
+    # -- elevenlabs seconds epoch + credits
+    def t_elevenlabs():
+        http = http_of([("/v1/user/subscription", (200, fx("elevenlabs-subscription.json")))])
+        norm = fetch_elevenlabs("k", {}, http)
+        assert norm["remaining"] == Decimal(71000)
+        assert norm["currency"] == "credits"
+        assert norm["resetsAt"] == "2026-09-10T00:00:00Z", norm["resetsAt"]
+        assert norm["tierLabel"] == "creator"
+        row = build_row("elevenlabs", norm, "2026-08-28T15:49:58Z", th)
+        assert row["balance"]["remaining"] == "71000"
+        assert row["balance"]["funded"] == "100000"
+        assert row["balance"]["currency"] == "credits"
+        assert row["severity"] == "ok"
+    t("elevenlabs subscription -> credits + seconds epoch", t_elevenlabs)
+
+    # -- elevenlabs credits ignore USD thresholds
+    def t_credit_severity():
+        assert severity_of(Decimal(5), 0.5, "credits", th) == "ok"
+        assert severity_of(Decimal(5000), 0.15, "credits", th) == "low"
+        assert severity_of(Decimal(5000), 0.04, "credits", th) == "critical"
+        assert severity_of(Decimal("9.50"), 0.5, "USD", th) == "low"
+        assert severity_of(Decimal("2.99"), 0.5, "USD", th) == "critical"
+        assert severity_of(Decimal("50"), 0.19, "USD", th) == "low"
+        assert severity_of(Decimal("50"), 0.04, "USD", th) == "critical"
+        assert severity_of(Decimal("50"), 0.5, "USD", th) == "ok"
+        assert severity_of(None, None, "USD", th) == "unknown"
+    t("severity thresholds (USD + credits-only-percent)", t_credit_severity)
+
+    # -- anthropic cents parse
+    def t_anthropic_cents():
+        http = http_of([("cost_report", (200, fx("anthropic-cost-report.json")))])
+        spent = fetch_anthropic_costs("k", http, date(2026, 8, 1), date(2026, 8, 15), {"amounts_are_cents": True})
+        assert spent == Decimal("1.2378912"), spent
+        assert fmt_money(spent) == "1.24"
+        http2 = http_of([("cost_report", (200, fx("anthropic-cost-report.json")))])
+        spent_d = fetch_anthropic_costs("k", http2, date(2026, 8, 1), date(2026, 8, 15), {"amounts_are_cents": False})
+        assert fmt_money(spent_d) == "123.79"
+    t('anthropic cents: "123.78912" cents -> $1.24', t_anthropic_cents)
+
+    # -- anthropic pagination
+    def t_anthropic_pages():
+        pages = [(200, fx("anthropic-cost-report-p1.json")), (200, fx("anthropic-cost-report-p2.json"))]
+        http = http_of([("cost_report", lambda: pages.pop(0))])
+        spent = fetch_anthropic_costs("k", http, date(2026, 8, 1), date(2026, 8, 15), {"amounts_are_cents": True})
+        assert spent == Decimal("1.5"), spent
+        assert len(http.calls) == 2
+        assert "page=" in http.calls[1][0]
+        assert http.calls[1][1]["anthropic-version"] == ANTHROPIC_VERSION
+    t("anthropic pagination has_more/next_page", t_anthropic_pages)
+
+    # -- openai pagination
+    def t_openai_pages():
+        pages = [(200, fx("openai-costs-p1.json")), (200, fx("openai-costs-p2.json"))]
+        http = http_of([("organization/costs", lambda: pages.pop(0))])
+        spent = fetch_openai_costs("k", http, date(2026, 8, 1), None, {})
+        assert spent == Decimal("18.78"), spent
+        assert len(http.calls) == 2
+        assert "page=page_AAAA" in http.calls[1][0]
+    t("openai costs pagination + bucket summing", t_openai_pages)
+
+    # -- ledger math, checkpoint, rollover
+    def openai_page(value):
+        return json.dumps({
+            "object": "page", "has_more": False, "next_page": None,
+            "data": [{"object": "bucket", "start_time": 0, "end_time": 0,
+                      "results": [{"amount": {"value": value, "currency": "usd"}}]}],
+        }).encode()
+
+    def hist_aware_http(hist_value, cur_value):
+        def http(url, headers):
+            http.calls.append(url)
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            if "end_time" in q and int(q["end_time"][0]) == epoch(date(2026, 8, 1)):
+                return 200, openai_page(hist_value)
+            return 200, openai_page(cur_value)
+        http.calls = []
+        return http
+
+    def t_ledger_checkpoint():
+        pcfg = {"enabled": True, "ledger": {"entries": [
+            {"date": "2026-06-10", "amount": "40.00"}, {"date": "2026-07-01", "amount": "20.00"}]}}
+        today = date(2026, 8, 15)
+        cache = {}
+        http = hist_aware_http(10.5, 2.5)
+        norm = fetch_ledger_provider("openai-api", "k", pcfg, http, cache, today)
+        assert len(http.calls) == 2, http.calls
+        assert cache["checkpoint"]["throughMonth"] == "2026-07"
+        assert Decimal(cache["checkpoint"]["spent"]) == Decimal("10.5")
+        assert norm["funded"] == Decimal("60.00")
+        assert norm["spent"] == Decimal("13.0")
+        assert fmt_money(norm["remaining"]) == "47.00"
+        assert norm["estimated"] is True and norm["source"] == "ledger"
+        assert norm["ledgerSince"] == "2026-06-10"
+        # second run with a valid checkpoint: only the current month is refetched
+        http2 = hist_aware_http(10.5, 2.5)
+        fetch_ledger_provider("openai-api", "k", pcfg, http2, cache, today)
+        assert len(http2.calls) == 1, http2.calls
+        # ledger edit invalidates the checkpoint
+        pcfg2 = {"enabled": True, "ledger": {"entries": [
+            {"date": "2026-06-10", "amount": "40.00"}, {"date": "2026-07-01", "amount": "30.00"}]}}
+        http3 = hist_aware_http(10.5, 2.5)
+        fetch_ledger_provider("openai-api", "k", pcfg2, http3, cache, today)
+        assert len(http3.calls) == 2, http3.calls
+        # month rollover invalidates the checkpoint
+        http4 = hist_aware_http(13.0, 1.0)
+        fetch_ledger_provider("openai-api", "k", pcfg2, http4, cache, date(2026, 9, 2))
+        assert len(http4.calls) == 2, http4.calls
+        assert cache["checkpoint"]["throughMonth"] == "2026-08"
+    t("ledger math + checkpoint reuse + rebuild on edit/rollover", t_ledger_checkpoint)
+
+    def t_ledger_clamp():
+        pcfg = {"enabled": True, "ledger": {"entries": [{"date": "2026-08-01", "amount": "10.00"}]}}
+        cache = {}
+        http = hist_aware_http(0, 12.0)
+        norm = fetch_ledger_provider("openai-api", "k", pcfg, http, cache, date(2026, 8, 15))
+        assert norm["remaining"] == Decimal("0")
+        assert norm["clamped"] is True
+        assert norm["preClampRemaining"] == Decimal("-2.0")
+        row = build_row("openai-api", norm, "2026-08-28T15:49:58Z", th)
+        assert row["balance"]["remaining"] == "0.00"
+        assert "ledger out of date?" in row["detail"]
+        assert row["percentRemaining"] == 0.0
+        assert row["severity"] == "critical"
+    t("ledger clamp at $0 + out-of-date detail", t_ledger_clamp)
+
+    def t_unit_suspect():
+        pcfg = {"enabled": True, "amounts_are_cents": False,
+                "ledger": {"entries": [{"date": "2026-08-01", "amount": "2.00"}]}}
+        http = http_of([("cost_report", (200, fx("anthropic-cost-report.json")))])
+        try:
+            fetch_ledger_provider("anthropic-api", "k", pcfg, http, {}, date(2026, 8, 15))
+            raise AssertionError("expected unit-suspect")
+        except FetchError as e:
+            assert e.kind == "unit-suspect", e.kind
+    t("anthropic unit-suspect guard (spent > 50x funded)", t_unit_suspect)
+
+    def t_no_ledger():
+        try:
+            fetch_ledger_provider("openai-api", "k", {"enabled": True}, http_of([]), {}, date(2026, 8, 15))
+            raise AssertionError("expected config error")
+        except FetchError as e:
+            assert e.kind == "config"
+            assert "ledger set" in (e.hint or "")
+            assert INVOKE in e.hint  # hint carries the invocable path
+    t("ledger provider without entries -> config error", t_no_ledger)
+
+    # -- sanitizer
+    def t_sanitizer():
+        assert sanitize("a<b>\x01\n\tc") == "a‹b›c"
+        assert sanitize("x" * 500) == "x" * 200
+        assert sanitize(None) is None
+        assert sanitize("ok tier") == "ok tier"
+        assert sanitize("a\x9bb") == "ab"                # C1 control (Cc)
+        assert sanitize("a\u202eb") == "ab"              # RTL override (Cf)
+        assert sanitize("a\u200db") == "ab"              # zero-width joiner (Cf)
+        assert sanitize("a\u200b\u2060b") == "ab"        # zero-width space + word joiner (Cf)
+    t("sanitizer strips Cc/Cf (C1, bidi, ZWJ), brackets, caps 200", t_sanitizer)
+
+    # -- error bodies -> messages
+    def t_error_bodies():
+        for name, needle in (
+            ("openrouter-credits-403.json", "management keys"),
+            ("elevenlabs-error-401.json", "missing the permission"),
+            ("anthropic-error-401.json", "invalid x-api-key"),
+            ("openai-error-401.json", "Incorrect API key"),
+        ):
+            msg = extract_error_message(fx(name))
+            assert needle.lower() in msg.lower(), (name, msg)
+    t("error body message extraction", t_error_bodies)
+
+    # -- snapshot schema shape + totals
+    def make_rows():
+        h1 = http_of([("https://openrouter.ai/api/v1/credits", (200, fx("openrouter-credits.json")))])
+        r1 = build_row("openrouter", fetch_openrouter("k", {}, h1), "2026-08-28T15:49:58Z", th)
+        h2 = http_of([("/v1/user/subscription", (200, fx("elevenlabs-subscription.json")))])
+        r2 = build_row("elevenlabs", fetch_elevenlabs("k", {}, h2), "2026-08-28T15:49:58Z", th)
+        pcfg = {"enabled": True, "ledger": {"entries": [{"date": "2026-08-01", "amount": "60.00"}]}}
+        h3 = hist_aware_http(0, 11.24)
+        r3 = build_row("openai-api", fetch_ledger_provider("openai-api", "k", pcfg, h3, {}, date(2026, 8, 15)),
+                       "2026-08-28T15:49:58Z", th)
+        return r1, r2, r3
+
+    def t_snapshot_shape():
+        r1, r2, r3 = make_rows()
+        rows = [r1, r2, r3, unconfigured_row("vercel-ai")]
+        snap = build_snapshot(rows, datetime(2026, 8, 28, 15, 50, tzinfo=timezone.utc))
+        assert snap["schemaVersion"] == 1
+        assert snap["generatedAt"] == "2026-08-28T15:50:00Z"
+        assert isinstance(snap["totalRemainingUsd"], str)
+        for row in snap["providers"]:
+            for k in ("id", "name", "status", "source", "balance", "percentRemaining", "severity",
+                      "resetsAt", "ledgerSince", "detail", "fetchedAt", "stale", "error", "hint"):
+                assert k in row, (row["id"], k)
+            if row["balance"]:
+                assert isinstance(row["balance"]["remaining"], str)
+                assert isinstance(row["balance"]["spent"], str)
+        u = [r for r in snap["providers"] if r["status"] == "unconfigured"][0]
+        assert u["hint"] == f"Run: {INVOKE} key set vercel-ai"
+        json.dumps(snap)
+    t("snapshot schema shape (money strings, hint on unconfigured)", t_snapshot_shape)
+
+    def t_total_excludes_credits():
+        r1, r2, r3 = make_rows()
+        snap = build_snapshot([r1, r2, r3], utcnow())
+        # 23.40 (openrouter) + 48.76 (openai ledger); elevenlabs credits excluded
+        assert snap["totalRemainingUsd"] == "72.16", snap["totalRemainingUsd"]
+        assert snap["anyEstimated"] is True
+        snap2 = build_snapshot([r1, r2], utcnow())
+        assert snap2["totalRemainingUsd"] == "23.40"
+        assert snap2["anyEstimated"] is False
+        err = error_row("vercel-ai", {"kind": "network", "message": "boom", "hint": None}, None)
+        snap3 = build_snapshot([r1, err], utcnow())
+        assert snap3["totalRemainingUsd"] == "23.40"
+    t("totalRemainingUsd sums USD only, excludes credits/errors", t_total_excludes_credits)
+
+    def t_attention():
+        r1, r2, r3 = make_rows()
+        r1["severity"] = "low"
+        r1["percentRemaining"] = 0.15
+        r3["severity"] = "low"
+        r3["percentRemaining"] = 0.1
+        snap = build_snapshot([r1, r2, r3], utcnow())
+        assert snap["attention"] == "openai-api"
+        r2["severity"] = "critical"
+        snap2 = build_snapshot([r1, r2, r3], utcnow())
+        assert snap2["attention"] == "elevenlabs"
+        r1["severity"] = r2["severity"] = r3["severity"] = "ok"
+        snap3 = build_snapshot([r1, r2, r3], utcnow())
+        assert snap3["attention"] is None
+    t("attention: worst severity, ties by lowest percent", t_attention)
+
+    # -- agents record shape (numbers!)
+    def t_record_shape():
+        h1 = http_of([("https://openrouter.ai/api/v1/credits", (200, fx("openrouter-credits.json")))])
+        rec = build_record("openrouter", fetch_openrouter("k", {}, h1), "2026-08-28T15:49:58Z")
+        assert rec["schemaVersion"] == 1 and rec["id"] == "openrouter" and rec["scope"] == "account"
+        assert rec["ready"] is True
+        b = rec["balance"]
+        assert type(b["remaining"]) is float and b["remaining"] == 23.4
+        assert type(b["funded"]) is float and b["funded"] == 120.0
+        assert type(b["spent"]) is float and b["spent"] == 96.6
+        assert b["currency"] == "USD" and b["estimated"] is False
+        assert rec["limits"] == []
+        assert rec["tierLabel"] == "Prepaid"
+        assert rec["usageStatusText"] == "$23.40 remaining · $96.60 used"
+        assert rec["totalPrompts"] == 0 and rec["todayPrompts"] == 0
+        h2 = http_of([("/v1/user/subscription", (200, fx("elevenlabs-subscription.json")))])
+        rec2 = build_record("elevenlabs", fetch_elevenlabs("k", {}, h2), "2026-08-28T15:49:58Z")
+        assert "balance" not in rec2
+        lim = rec2["limits"][0]
+        assert lim["label"] == "Credits" and lim["title"] == "Credits"
+        assert type(lim["percent"]) is float and lim["percent"] == 0.29
+        assert lim["resetsAt"] == "2026-09-10T00:00:00Z"
+        assert rec2["usageStatusText"] == "71,000 of 100,000 credits"
+        assert rec2["tierLabel"] == "creator"
+        pcfg = {"enabled": True, "ledger": {"entries": [{"date": "2026-08-01", "amount": "60.00"}]}}
+        h3 = hist_aware_http(0, 18.78)
+        rec3 = build_record("openai-api", fetch_ledger_provider("openai-api", "k", pcfg, h3, {}, date(2026, 8, 15)),
+                            "2026-08-28T15:49:58Z")
+        assert rec3["balance"]["estimated"] is True
+        assert rec3["tierLabel"] == "Prepaid (est.)"
+        assert rec3["usageStatusText"] == "≈ $41.22 remaining since Aug 1"
+        errrec = error_record("vercel-ai", {"kind": "auth", "message": "HTTP 401: nope", "hint": None},
+                              "2026-08-28T15:49:58Z")
+        assert errrec["ready"] is False and "balance" not in errrec
+        assert errrec["authHelpText"]
+    t("agents records: numbers, limits, estimated, error shape", t_record_shape)
+
+    # -- stale handling
+    def t_stale():
+        now = utcnow()
+        good_row = {"id": "openrouter", "name": "OpenRouter", "status": "ok", "source": "credits",
+                    "balance": {"remaining": "23.40", "funded": "120.00", "spent": "96.60",
+                                "currency": "USD", "estimated": False},
+                    "percentRemaining": 0.195, "severity": "low", "resetsAt": None, "ledgerSince": None,
+                    "detail": "d", "fetchedAt": iso(now - timedelta(days=1)), "stale": False,
+                    "error": None, "hint": None}
+        good_rec = {"id": "openrouter", "ready": True, "updatedAt": iso(now - timedelta(days=1)),
+                    "balance": {"remaining": 23.4}}
+        cache = {"lastAttempt": iso(now), "failCount": 1,
+                 "lastError": {"kind": "network", "message": "boom", "hint": None},
+                 "lastGood": {"fetchedAt": iso(now - timedelta(days=1)), "row": good_row, "record": good_rec}}
+        row, rec = row_from_cache("openrouter", cache, now)
+        assert row["stale"] is True and row["status"] == "ok"
+        assert row["error"]["kind"] == "network"
+        assert rec == good_rec  # non-auth/config error: cached record unchanged, updatedAt = data time
+        cache["lastGood"]["fetchedAt"] = iso(now - timedelta(days=8))
+        row2, rec2 = row_from_cache("openrouter", cache, now)
+        assert row2["status"] == "error" and row2["error"]["kind"] == "stale-expired"
+        assert row2["balance"] is None
+        assert rec2["ready"] is False
+    t("stale <=7d keeps last-good row+record, then stale-expired", t_stale)
+
+    def t_auth_error_record():
+        now = utcnow()
+        good_row = {"id": "openrouter", "status": "ok", "balance": {"remaining": "23.40"},
+                    "stale": False, "error": None}
+        good_rec = {"id": "openrouter", "ready": True, "updatedAt": iso(now - timedelta(days=1))}
+        cache = {"lastAttempt": iso(now), "failCount": 1,
+                 "lastError": {"kind": "auth", "message": "HTTP 401: nope", "hint": "fix the key"},
+                 "lastGood": {"fetchedAt": iso(now - timedelta(days=1)), "row": good_row, "record": good_rec}}
+        # auth error with fresh last-good: row stays stale/ok, record flips to ready:false
+        row, rec = row_from_cache("openrouter", cache, now)
+        assert row["stale"] is True and row["status"] == "ok"
+        assert rec["ready"] is False and "balance" not in rec and rec["limits"] == []
+        assert rec["authHelpText"] == "fix the key"
+        assert rec["updatedAt"] == iso(now)
+        # config kind behaves the same
+        cache["lastError"] = {"kind": "config", "message": "bad ledger", "hint": None}
+        _, rec2 = row_from_cache("openrouter", cache, now)
+        assert rec2["ready"] is False and "balance" not in rec2
+        # no last-good at all -> ready:false record
+        _, rec3 = row_from_cache("openrouter", {"lastError": {"kind": "network", "message": "boom"}}, now)
+        assert rec3["ready"] is False
+    t("auth/config error flips record to ready:false despite fresh cache", t_auth_error_record)
+
+    # -- backoff schedule
+    def t_backoff():
+        now = utcnow()
+        cache = {"lastAttempt": iso(now - timedelta(seconds=400)), "failCount": 0}
+        assert compute_due(cache, now, 300) is True
+        cache = {"lastAttempt": iso(now - timedelta(seconds=200)), "failCount": 0}
+        assert compute_due(cache, now, 300) is False
+        cache = {"lastAttempt": iso(now - timedelta(seconds=400)), "failCount": 1}
+        assert compute_due(cache, now, 300) is False  # 600s backoff
+        cache = {"lastAttempt": iso(now - timedelta(seconds=700)), "failCount": 1}
+        assert compute_due(cache, now, 300) is True
+        cache = {"lastAttempt": iso(now - timedelta(seconds=3500)), "failCount": 10}
+        assert compute_due(cache, now, 300) is False  # capped at 3600
+        cache = {"lastAttempt": iso(now - timedelta(seconds=3700)), "failCount": 10}
+        assert compute_due(cache, now, 300) is True
+        assert compute_due({}, now, 300) is True
+    t("TTL gate + exponential backoff capped at 1h", t_backoff)
+
+    # -- helpers for tests that touch the state dir / run sync
+    def isolated_state():
+        td = tempfile.mkdtemp(prefix="omarchy-balances-selftest-")
+        old = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = td
+
+        def restore():
+            if old is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = old
+            shutil.rmtree(td, ignore_errors=True)
+        return Path(td), restore
+
+    def run_sync():
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cmd_sync(argparse.Namespace(force=False, provider=None))
+        return rc, json.loads(buf.getvalue())
+
+    # -- config value validation
+    def t_config_validation():
+        cases = [
+            ({"thresholds": {"lowUsd": "ten"}}, "thresholds.lowUsd"),
+            ({"thresholds": {"lowPercent": None}}, "thresholds.lowPercent"),
+            ({"thresholds": {"lowPercent": 0}}, "thresholds.lowPercent"),
+            ({"thresholds": {"criticalPercent": 1.5}}, "thresholds.criticalPercent"),
+            ({"thresholds": {"criticalUsd": -1}}, "thresholds.criticalUsd"),
+            ({"thresholds": []}, "thresholds"),
+            ({"providers": []}, "providers"),
+            ({"providers": {"openrouter": "on"}}, "providers.openrouter"),
+            ({"providers": {"openrouter": {"enabled": "yes"}}}, "providers.openrouter.enabled"),
+            ({"providers": {"anthropic-api": {"amounts_are_cents": 1}}},
+             "providers.anthropic-api.amounts_are_cents"),
+            ({"providers": {"elevenlabs": {"baseUrl": 5}}}, "providers.elevenlabs.baseUrl"),
+            ({"providers": {"openai-api": {"ledger": "x"}}}, "providers.openai-api.ledger"),
+            ({"providers": {"openai-api": {"ledger": {"entries": {}}}}},
+             "providers.openai-api.ledger.entries"),
+            ({"providers": {"openai-api": {"ledger": {"entries": ["x"]}}}},
+             "providers.openai-api.ledger.entries[0]"),
+            ({"providers": {"openai-api": {"ledger": {"entries": [{"date": "nope", "amount": "1"}]}}}},
+             "providers.openai-api.ledger.entries[0].date"),
+            ({"providers": {"openai-api": {"ledger": {"entries": [{"date": "2026-08-01", "amount": "x"}]}}}},
+             "providers.openai-api.ledger.entries[0].amount"),
+            ({"providers": {"openai-api": {"ledger": {"entries": [{"date": "2026-08-01"}]}}}},
+             "providers.openai-api.ledger.entries[0].amount"),
+        ]
+        _, restore = isolated_state()
+        try:
+            for raw, needle in cases:
+                atomic_write_json(config_path(), raw)
+                cfg, err = load_config()
+                assert cfg is None and err and needle in err, (raw, err)
+            atomic_write_json(config_path(), {"thresholds": {"lowUsd": "12.5", "lowPercent": 0.25},
+                                              "providers": {"openrouter": {"enabled": False}}})
+            cfg, err = load_config()
+            assert err is None and cfg["thresholds"]["lowUsd"] == "12.5"
+            assert cfg["providers"]["openrouter"]["enabled"] is False
+        finally:
+            restore()
+    t("load_config rejects bad values, names the offending key", t_config_validation)
+
+    def t_config_error_snapshot():
+        # the exact hand-edit probes: bad values must yield a config snapshot + exit 2
+        for raw in ({"thresholds": {"lowUsd": "ten"}}, {"thresholds": {"lowPercent": None}}):
+            _, restore = isolated_state()
+            try:
+                atomic_write_json(config_path(), raw)
+                rc, snap = run_sync()
+                assert rc == 2, rc
+                assert len(snap["providers"]) == len(PROVIDERS)
+                for r in snap["providers"]:
+                    assert r["status"] == "error" and r["error"]["kind"] == "config"
+                key = "lowUsd" if "lowUsd" in raw["thresholds"] else "lowPercent"
+                assert key in snap["providers"][0]["error"]["message"]
+                assert json.loads((state_dir() / "snapshot.json").read_text())["providers"]
+            finally:
+                restore()
+    t("sync on bad config values -> config snapshot + exit 2", t_config_error_snapshot)
+
+    def t_sync_internal_error():
+        _, restore = isolated_state()
+        g = globals()
+        orig = g["load_secrets"]
+
+        def boom():
+            raise RuntimeError("boom")
+        g["load_secrets"] = boom
+        try:
+            rc, snap = run_sync()
+            assert rc == 2, rc
+            for r in snap["providers"]:
+                assert r["error"]["kind"] == "config"
+            assert "internal error" in snap["providers"][0]["error"]["message"]
+            assert INVOKE in snap["providers"][0]["error"]["hint"]
+        finally:
+            g["load_secrets"] = orig
+            restore()
+    t("sync wraps unexpected exceptions -> config snapshot + exit 2", t_sync_internal_error)
+
+    # -- disabled / unconfigured cleanup
+    def t_cleanup_disabled_unconfigured():
+        _, restore = isolated_state()
+        try:
+            ensure_dirs()
+            atomic_write_json(config_path(), {"providers": {"openrouter": {"enabled": False}}})
+            # openrouter is disabled; vercel-ai is enabled but has no key (no secrets.json)
+            for pid in ("openrouter", "vercel-ai"):
+                atomic_write_json(cache_path(pid), {"lastAttempt": iso(utcnow())})
+                atomic_write_json(agents_dir() / f"{pid}.json", {"id": pid})
+            rc, snap = run_sync()
+            assert rc == 0, rc
+            ids = [r["id"] for r in snap["providers"]]
+            assert "openrouter" not in ids  # disabled -> omitted from snapshot
+            assert all(r["status"] == "unconfigured" for r in snap["providers"])
+            for pid in ("openrouter", "vercel-ai"):
+                assert not cache_path(pid).exists(), pid
+                assert not (agents_dir() / f"{pid}.json").exists(), pid
+            assert snap["providers"][0]["hint"] == f"Run: {INVOKE} key set vercel-ai"
+        finally:
+            restore()
+    t("sync unlinks record+cache for disabled and unconfigured", t_cleanup_disabled_unconfigured)
+
+    # -- 200 responses that are not JSON objects
+    def t_nondict_json():
+        def expect_shape(fn):
+            try:
+                fn()
+                raise AssertionError("expected FetchError")
+            except FetchError as e:
+                assert e.kind == "http" and "unexpected response shape" in e.message, (e.kind, e.message)
+        for bad in ("body-null.json", "body-array.json"):
+            expect_shape(lambda: fetch_openrouter(
+                "k", {}, http_of([("https://openrouter.ai/api/v1/credits", (200, fx(bad)))])))
+            expect_shape(lambda: fetch_openrouter("k", {}, http_of([
+                ("https://openrouter.ai/api/v1/credits", (403, fx("openrouter-credits-403.json"))),
+                ("https://openrouter.ai/api/v1/key", (200, fx(bad)))])))
+            expect_shape(lambda: fetch_vercel(
+                "k", {}, http_of([("https://ai-gateway.vercel.sh/v1/credits", (200, fx(bad)))])))
+            expect_shape(lambda: fetch_elevenlabs(
+                "k", {}, http_of([("/v1/user/subscription", (200, fx(bad)))])))
+            expect_shape(lambda: fetch_openai_costs(
+                "k", http_of([("organization/costs", (200, fx(bad)))]), date(2026, 8, 1), None, {}))
+            expect_shape(lambda: fetch_anthropic_costs(
+                "k", http_of([("cost_report", (200, fx(bad)))]), date(2026, 8, 1), date(2026, 8, 15), {}))
+    t("200 with JSON null/array body -> http error, no traceback", t_nondict_json)
+
+    # -- elevenlabs baseUrl scheme
+    def t_elevenlabs_baseurl():
+        try:
+            fetch_elevenlabs("k", {"baseUrl": "http://evil.example"}, http_of([]))
+            raise AssertionError("expected FetchError")
+        except FetchError as e:
+            assert e.kind == "config", e.kind
+            assert "config.json" in (e.hint or "")
+        # loopback allowance keeps local mocks/selftests working
+        for base in ("http://127.0.0.1:8123", "http://localhost:8123"):
+            http = http_of([("/v1/user/subscription", (200, fx("elevenlabs-subscription.json")))])
+            norm = fetch_elevenlabs("k", {"baseUrl": base}, http)
+            assert norm["currency"] == "credits"
+            assert http.calls[0][0].startswith(base)
+        # doctor path goes through fetch_provider -> same check
+        try:
+            fetch_provider("elevenlabs", "k", {"baseUrl": "ftp://x"}, http_of([]), {}, date(2026, 8, 15))
+            raise AssertionError("expected FetchError")
+        except FetchError as e:
+            assert e.kind == "config"
+    t("elevenlabs baseUrl requires https (loopback allowed)", t_elevenlabs_baseurl)
+
+    # -- hints carry the invocable command
+    def t_invoke_hints():
+        assert INVOKE.startswith("python3 /"), INVOKE
+        row = unconfigured_row("openrouter")
+        assert row["hint"] == f"Run: {INVOKE} key set openrouter"
+        assert len(row["hint"]) <= 200  # stays inside the sanitizer cap
+        rec = error_record("openrouter", {"kind": "auth", "message": "m", "hint": None},
+                           "2026-08-28T15:49:58Z")
+        assert rec["authHelpText"] == f"Run: {INVOKE} doctor"
+        assert len(rec["authHelpText"]) <= 200
+        # a FetchError hint survives the sanitize applied when caching errors
+        assert INVOKE in sanitize(f"Run: {INVOKE} ledger set openai-api --funded <usd> --since <YYYY-MM-DD>")
+    t("user-facing hints use the python3+path invocation", t_invoke_hints)
+
+    failures = [(n, e) for n, e in results if e]
+    for name, err in results:
+        print(f"{'FAIL' if err else 'ok':4}  {name}" + (f" — {err}" if err else ""))
+    print(f"\n{len(results) - len(failures)}/{len(results)} passed")
+    return 1 if failures else 0
+
+
+# ---------- main ----------
+
+def main():
+    parser = argparse.ArgumentParser(prog="omarchy-balances", description="AI provider balances for Omarchy")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_sync = sub.add_parser("sync", help="fetch stale providers, write snapshot + agents records")
+    p_sync.add_argument("--force", action="store_true")
+    p_sync.add_argument("--provider", choices=PROVIDERS)
+    p_sync.set_defaults(fn=cmd_sync)
+
+    p_status = sub.add_parser("status", help="print snapshot.json without touching the network")
+    p_status.set_defaults(fn=cmd_status)
+
+    p_key = sub.add_parser("key", help="manage API keys (stored in secrets.json, 0600)")
+    key_sub = p_key.add_subparsers(dest="action", required=True)
+    k_set = key_sub.add_parser("set")
+    k_set.add_argument("provider", choices=PROVIDERS)
+    k_clear = key_sub.add_parser("clear")
+    k_clear.add_argument("provider", choices=PROVIDERS)
+    key_sub.add_parser("list")
+    p_key.set_defaults(fn=cmd_key)
+
+    p_ledger = sub.add_parser("ledger", help="funding ledger for openai-api / anthropic-api")
+    ledger_sub = p_ledger.add_subparsers(dest="action", required=True)
+    l_set = ledger_sub.add_parser("set")
+    l_set.add_argument("provider", choices=list(LEDGER_PROVIDERS))
+    l_set.add_argument("--funded", required=True)
+    l_set.add_argument("--since", required=True)
+    l_add = ledger_sub.add_parser("add")
+    l_add.add_argument("provider", choices=list(LEDGER_PROVIDERS))
+    l_add.add_argument("--amount", required=True)
+    l_add.add_argument("--date")
+    ledger_sub.add_parser("show")
+    p_ledger.set_defaults(fn=cmd_ledger)
+
+    sub.add_parser("setup", help="interactive first-run wizard").set_defaults(fn=cmd_setup)
+    sub.add_parser("doctor", help="live-check every configured provider").set_defaults(fn=cmd_doctor)
+    sub.add_parser("selftest", help="offline tests against tests/fixtures").set_defaults(fn=lambda a: run_selftest())
+    sub.add_parser("cleanup", help="remove agents records and the state dir").set_defaults(fn=cmd_cleanup)
+
+    args = parser.parse_args()
+    try:
+        sys.exit(args.fn(args))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

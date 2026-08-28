@@ -1,0 +1,15 @@
+{
+  "data": {
+    "label": "widget",
+    "limit": 30.0,
+    "limit_remaining": 23.4,
+    "limit_reset": "monthly",
+    "include_byok_in_limit": false,
+    "usage": 120.5,
+    "usage_daily": 0.5,
+    "usage_weekly": 2.2,
+    "usage_monthly": 6.6,
+    "byok_usage": 0,
+    "is_free_tier": false
+  }
+}

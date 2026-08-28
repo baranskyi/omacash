@@ -1,0 +1,16 @@
+{
+  "data": [
+    {
+      "starting_at": "2026-08-02T00:00:00Z",
+      "ending_at": "2026-08-03T00:00:00Z",
+      "results": [
+        {
+          "currency": "USD",
+          "amount": "50"
+        }
+      ]
+    }
+  ],
+  "has_more": false,
+  "next_page": null
+}

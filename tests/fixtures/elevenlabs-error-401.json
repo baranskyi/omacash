@@ -1,0 +1,6 @@
+{
+  "detail": {
+    "status": "missing_permissions",
+    "message": "The API key you used is missing the permission user_read to execute this operation."
+  }
+}

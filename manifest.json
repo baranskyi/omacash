@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.baranskyi.balances",
+  "name": "Balances",
+  "version": "0.1.0",
+  "author": "Slava Baranskyi",
+  "license": "MIT",
+  "description": "Remaining money and credits across OpenRouter, Vercel AI Gateway, ElevenLabs, OpenAI, and Anthropic in one bar pill, popup, and Agents-panel records.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "omarchy/BarWidget.qml",
+    "service": "service/Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Balances",
+    "description": "Prepaid balances, credits, and ledger-estimated remainders for five AI providers, with severity meters and reset countdowns.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pillMode": "total",
+      "pinnedProvider": "openrouter",
+      "showLabel": false
+    },
+    "schema": [
+      {
+        "key": "pillMode",
+        "type": "enum",
+        "label": "Pill mode",
+        "description": "What the bar pill shows: the USD total across providers, the provider that most needs attention, or one pinned provider. No settings GUI exists in this build; set it with: omarchy bar set io.github.baranskyi.balances pillMode <value>",
+        "options": ["total", "attention", "pinned"],
+        "defaultValue": "total"
+      },
+      {
+        "key": "pinnedProvider",
+        "type": "enum",
+        "label": "Pinned provider",
+        "description": "Provider shown when pillMode is pinned. The mouse wheel on the pill cycles this.",
+        "options": ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api"],
+        "defaultValue": "openrouter"
+      },
+      {
+        "key": "showLabel",
+        "type": "boolean",
+        "label": "Show provider tag",
+        "description": "Prefix the pinned provider's value with its short tag (for example OR $23.40). The attention mode always shows the tag.",
+        "defaultValue": false
+      }
+    ]
+  }
+}
