@@ -4,7 +4,8 @@ import qs.Ui
 
 // Bar entry point. The popup is loaded separately so this object owns shell
 // routing (Bar.findPanelWidget needs open/close/opened here) while Panel.qml
-// owns snapshot parsing and presentation.
+// owns presentation. Neither reads any file: the plugin's service singleton
+// runs the CLI and publishes the parsed model to every monitor's panel.
 BarWidget {
   id: root
   moduleName: "io.github.baranskyi.omacash"
@@ -77,9 +78,9 @@ BarWidget {
     horizontalMargin: 8.5
 
     onPressed: function(buttonCode) {
-      // Refresh only this instance; the other monitors' panels converge
-      // through their snapshot.json FileView watchers, so a broadcast would
-      // just race N CLI runs against the sync lock.
+      // Refresh through this instance only; the shared service single-flights
+      // the CLI run and publishes to every monitor, so a broadcast would just
+      // race N identical requests.
       if (buttonCode === Qt.RightButton) root.refresh()
       else if (buttonCode === Qt.MiddleButton) root.resetPillMode()
       else root.toggle()

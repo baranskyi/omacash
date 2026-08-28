@@ -78,6 +78,10 @@ press Save. The OpenAI/Anthropic admin keys and the OpenRouter
 management key are powerful credentials — this plugin only reads with them, but treat the
 machine's disk as their security boundary.
 
+Nothing in the shell opens that directory. The bar widget and popup hold no state path at all:
+a background service runs the bundled CLI and renders what the CLI prints, and the CLI is the
+only component that reads its own config, keys, cache, and snapshot.
+
 ## Use
 
 - **Left-click** the pill — popup with all balances (j/k scroll, r refresh, Esc close). The **Keys** footer button opens in-panel key entry; Esc there first returns to the balances list.

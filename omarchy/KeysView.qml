@@ -92,8 +92,6 @@ Column {
   function finishRun(exitCode, stderrText) {
     var id = activeId
     var action = activeAction
-    activeId = ""
-    activeAction = ""
     if (Number(exitCode) === 0) {
       if (action === "set") {
         savedId = id
@@ -105,6 +103,11 @@ Column {
     } else {
       setRowError(id, Model.keyCommandErrorMessage(exitCode, stderrText))
     }
+    // Cleared LAST: Panel.qml holds this view loaded for as long as activeId
+    // is set, so an Esc during a save cannot destroy the view (and its
+    // Process) before the result above has been applied.
+    activeId = ""
+    activeAction = ""
   }
 
   Timer {

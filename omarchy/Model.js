@@ -4,6 +4,11 @@
 // formatting of pre-rendered strings and the percent numbers the CLI computed.
 
 var MAX_PROVIDERS = 8
+// Hard ceiling on a snapshot document. The document reaches this long-lived
+// shell process as the stdout of the CLI, so bound it before JSON.parse ever
+// sees it — a runaway or tampered producer must not be able to grow the
+// shell's heap. Real snapshots are a few kilobytes.
+var MAX_SNAPSHOT_BYTES = 1048576
 var PROVIDER_ORDER = ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api"]
 var SHORT_TAGS = {
   "openrouter": "OR",
@@ -101,13 +106,31 @@ function normalizeProvider(raw) {
   }
 }
 
+// UTF-8 length of a JS string, stopping as soon as the limit is passed so a
+// huge input costs O(limit) rather than O(input).
+function utf8ByteLength(text, limit) {
+  var bytes = 0
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i)
+    if (code < 0x80) bytes += 1
+    else if (code < 0x800) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff) { bytes += 4; i++ }
+    else bytes += 3
+    if (bytes > limit) return bytes
+  }
+  return bytes
+}
+
 function parseSnapshot(raw) {
   var failure = function(message) {
     return { ok: false, error: message, model: null }
   }
+  var text = String(raw === undefined || raw === null ? "" : raw)
+  if (utf8ByteLength(text, MAX_SNAPSHOT_BYTES) > MAX_SNAPSHOT_BYTES)
+    return failure("The snapshot is too large to be genuine (over 1 MiB); it was not parsed.")
   var parsed
   try {
-    parsed = JSON.parse(String(raw || ""))
+    parsed = JSON.parse(text)
   } catch (error) {
     return failure("snapshot.json is not valid JSON.")
   }
@@ -133,6 +156,15 @@ function parseSnapshot(raw) {
       providers: providers
     }
   }
+}
+
+// Before the first sync, `status` prints a well-formed placeholder: no
+// providers and no generatedAt. It parses fine, but publishing it would read
+// as "every provider is disabled in config.json", so callers keep waiting for
+// a real document instead.
+function isUnwrittenSnapshot(model) {
+  if (!model) return true
+  return model.generatedAt === "" && model.providers.length === 0
 }
 
 // --------------------------------------------------------------- formatting
@@ -478,7 +510,7 @@ function keyCommandErrorMessage(exitCode, stderrText) {
   var code = Number(exitCode)
   if (code === 0) return ""
   if (code === 127)
-    return "python3 was not found. Install it with: sudo pacman -S python"
+    return "python3 was not found. Install python3 to use this plugin."
   var text = cleanText(stderrText, 2000).trim()
   if (text === "") return "The key command failed (exit " + code + ")."
   var lines = text.split("\n").filter(function(line) { return line.trim() !== "" })
@@ -524,7 +556,7 @@ function settingsWithOverrides(settings, moduleName, overrides) {
 // mapped by refreshStatusMessage instead.
 function launchErrorMessage(exitCode, stderrText) {
   if (Number(exitCode) === 127)
-    return "python3 was not found. Install it with: sudo pacman -S python"
+    return "python3 was not found. Install python3 to use this plugin."
   var message = cleanText(stderrText, 500).trim()
   return message === "" ? "The sync command failed without an error message." : autoTextSafe(message)
 }
@@ -537,4 +569,48 @@ function refreshStatusMessage(exitCode, stderrText) {
   if (code === 0 || code === 1) return ""
   if (code === 2) return "Configuration error — see provider rows."
   return launchErrorMessage(code, stderrText)
+}
+
+// Did a finished `sync` run fail to produce data, i.e. should the service push
+// its next attempt out?
+//
+// Exits 0, 1 and 2 are contract outcomes that printed a snapshot: 1 means every
+// configured provider errored, 2 means config or state is unreadable. Both are
+// carried by the snapshot rows and are repaired by editing a file, so the
+// service keeps its normal 300 s cadence and picks the repair up on the next
+// tick — backing off to an hour would leave a fixed config unnoticed. Backoff
+// is reserved for runs that produced nothing at all: a missing python3 (127),
+// a crash, an unexpected code, or a contract exit that printed no snapshot.
+function syncRunFailed(exitCode, stdout) {
+  var code = Number(exitCode)
+  if (code !== 0 && code !== 1 && code !== 2) return true
+  return String(stdout === undefined || stdout === null ? "" : stdout).trim() === ""
+}
+
+// ------------------------------------------------------------- sync queueing
+
+// The service runs one `sync` at a time. A request refused because a run is
+// already in flight must NOT be dropped and cannot ride that run's result: the
+// CLI read config and secrets before the request existed, so a key saved a
+// moment ago is invisible to it. Entering key A then key B back to back is
+// exactly that case — B's forced sync is refused while A's is still fetching.
+//
+// There is exactly ONE pending slot: any number of refusals collapse into a
+// single owed run, and `force` is sticky, so a manual refresh queued behind a
+// plain timer run still runs forced. The service clears the slot before it
+// starts the owed run, so a run launched from `onExited` can queue at most one
+// more request and the chain always terminates.
+function emptySyncQueue() {
+  return { pending: false, force: false }
+}
+
+function queueSync(queue, force) {
+  var heldForce = queue !== null && queue !== undefined
+    && queue.pending === true && queue.force === true
+  return { pending: true, force: heldForce || force === true }
+}
+
+function takeSync(queue) {
+  var pending = queue !== null && queue !== undefined && queue.pending === true
+  return { run: pending, force: pending && queue.force === true }
 }

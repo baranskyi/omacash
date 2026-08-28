@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import getpass
 import hashlib
@@ -10,6 +11,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,7 +55,7 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", 
 CENT = Decimal("0.01")
 
 
-# ---------- paths / time / small helpers ----------
+# ---------- paths (display only — every read/write goes through the verified dirfd walk) ----------
 
 def state_home():
     return Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
@@ -71,13 +73,390 @@ def agents_dir():
     return state_home() / "omarchy" / "agents" / "usage"
 
 
-def ensure_dirs():
-    sd = state_dir()
-    sd.mkdir(parents=True, exist_ok=True)
-    os.chmod(sd, 0o700)
-    cache_dir().mkdir(parents=True, exist_ok=True)
-    agents_dir().mkdir(parents=True, exist_ok=True)
+# ---------- verified private state: no-follow, dirfd-relative, bounded ----------
+#
+# Every path component from the trusted root down is opened with O_NOFOLLOW|O_DIRECTORY and
+# validated by fstat on the opened object (never by a stat of the name), so a swapped path
+# cannot be re-raced between the check and the use. Files are opened the same way and are
+# refused unless they are regular, owned by us, and within a per-file byte limit.
 
+# Per-file read limits. These bound what a long-lived shell can be made to parse.
+LIMIT_CONFIG = 256 * 1024
+LIMIT_SECRETS = 64 * 1024
+LIMIT_SNAPSHOT = 1024 * 1024
+LIMIT_CACHE = 1024 * 1024
+LIMIT_ALERTS = 256 * 1024
+
+DIR_MODE = 0o700     # our own state dirs
+FILE_MODE = 0o600    # every file we write is private state
+READ_CHUNK = 64 * 1024
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK so a FIFO planted in place of a file cannot park the CLI on open()
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+
+class StateError(Exception):
+    """A state path does not meet the required guarantees (type, owner, mode, size, encoding)."""
+
+    def __init__(self, path, reason):
+        super().__init__(f"{path}: {reason}")
+        self.path = str(path)
+        self.reason = reason
+
+
+def _why(e):
+    return e.strerror or errno.errorcode.get(e.errno, str(e))
+
+
+class DirHandle:
+    """An open, verified directory fd. Every operation under it is dirfd-relative."""
+
+    __slots__ = ("fd", "path")
+
+    def __init__(self, fd, path):
+        self.fd = fd
+        self.path = str(path)
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def _root_and_prefix():
+    """The trusted root plus the shared components between it and our own directories."""
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return os.path.normpath(xdg), ("omarchy",)
+    home = os.environ.get("HOME") or str(Path.home())
+    return os.path.normpath(home), (".local", "state", "omarchy")
+
+
+def _check_dir(fd, display, own):
+    """fstat the *opened* directory; own dirs are additionally pinned to 0700."""
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise StateError(display, "is not a directory")
+    euid = os.geteuid()
+    if st.st_uid != euid:
+        raise StateError(display, f"is owned by uid {st.st_uid}, not by this user (uid {euid})")
+    if st.st_mode & 0o022:
+        raise StateError(display, f"is group- or world-writable (mode {stat.S_IMODE(st.st_mode):04o})")
+    if own and stat.S_IMODE(st.st_mode) != DIR_MODE:
+        try:
+            os.fchmod(fd, DIR_MODE)
+        except OSError as e:
+            raise StateError(display, f"mode could not be repaired to 0700 ({_why(e)})") from e
+
+
+def _open_root(path):
+    """Open the trust anchor ($XDG_STATE_HOME or $HOME), resolved once and validated by fstat.
+
+    This is the only open in the walk without O_NOFOLLOW: the anchor comes from the user's own
+    environment, so a symlinked $HOME is their configuration, not an attack. What it resolves to
+    still has to be a directory this user owns that nobody else can write to.
+    """
+    if not os.path.isabs(path):
+        raise StateError(path, "state root must be an absolute path")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        try:
+            os.makedirs(path, DIR_MODE, exist_ok=True)
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as e:
+            raise StateError(path, f"state root is unusable ({_why(e)})") from e
+    except OSError as e:
+        raise StateError(path, f"state root is unusable ({_why(e)})") from e
+    try:
+        _check_dir(fd, path, own=False)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _bad_dir_reason(parent_fd, name, e):
+    """Describe a refusal. The refusal already happened — this only names it for the user.
+
+    O_NOFOLLOW|O_DIRECTORY reports a symlink as ENOTDIR on Linux, so lstat tells the two apart.
+    """
+    if e.errno == errno.ELOOP:
+        return "is a symlink, not a real directory"
+    try:
+        if stat.S_ISLNK(os.lstat(name, dir_fd=parent_fd).st_mode):
+            return "is a symlink, not a real directory"
+    except OSError:
+        pass
+    if e.errno == errno.ENOTDIR:
+        return "exists but is not a directory"
+    return f"cannot be opened safely ({_why(e)})"
+
+
+def _open_child_dir(parent_fd, name, display, own):
+    fd = None
+    for _ in range(3):
+        try:
+            fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+            break
+        except FileNotFoundError:
+            try:
+                os.mkdir(name, DIR_MODE, dir_fd=parent_fd)
+            except FileExistsError:
+                pass  # lost a create race; reopen and validate what is there now
+            except OSError as e:
+                raise StateError(display, f"could not be created ({_why(e)})") from e
+        except OSError as e:
+            raise StateError(display, _bad_dir_reason(parent_fd, name, e)) from e
+    if fd is None:
+        raise StateError(display, "could not be created or opened")
+    try:
+        _check_dir(fd, display, own)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def verified_dir(pairs):
+    """Walk root -> shared prefix -> pairs of (name, own), creating 0700 dirs as needed.
+
+    Returns an open DirHandle; the caller must close it (or use it as a context manager).
+    """
+    root, prefix = _root_and_prefix()
+    fd = _open_root(root)
+    display = root
+    try:
+        for name, own in [(p, False) for p in prefix] + list(pairs):
+            display = os.path.join(display, name)
+            child = _open_child_dir(fd, name, display, own)
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return DirHandle(fd, display)
+
+
+@contextlib.contextmanager
+def state_handle():
+    h = verified_dir([(PLUGIN_ID, True)])
+    try:
+        yield h
+    finally:
+        h.close()
+
+
+@contextlib.contextmanager
+def cache_handle():
+    h = verified_dir([(PLUGIN_ID, True), ("cache", True)])
+    try:
+        yield h
+    finally:
+        h.close()
+
+
+@contextlib.contextmanager
+def agents_handle():
+    # Shared with Omarchy's own collectors: same owner and not group/world-writable, but the
+    # mode is Omarchy's business — never forced to 0700.
+    h = verified_dir([("agents", False), ("usage", False)])
+    try:
+        yield h
+    finally:
+        h.close()
+
+
+def ensure_dirs():
+    with cache_handle():
+        pass
+    with agents_handle():
+        pass
+
+
+def read_bounded(dirfd, name, limit, display=None):
+    """Return the file's text, or None if it does not exist.
+
+    A symlink, a non-regular file, a file owned by anyone else, an oversize file or one that
+    is not UTF-8 is an ERROR — never silently treated as missing.
+    """
+    display = display or name
+    try:
+        fd = os.open(name, FILE_FLAGS, dir_fd=dirfd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise StateError(display, "is a symlink, not a regular file") from e
+        raise StateError(display, f"cannot be opened safely ({_why(e)})") from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise StateError(display, "is not a regular file")
+        euid = os.geteuid()
+        if st.st_uid != euid:
+            raise StateError(display, f"is owned by uid {st.st_uid}, not by this user (uid {euid})")
+        if st.st_size > limit:
+            raise StateError(display, f"is larger than the {limit} byte limit ({st.st_size} bytes)")
+        data = bytearray()
+        while len(data) <= limit:
+            try:
+                chunk = os.read(fd, min(READ_CHUNK, limit + 1 - len(data)))
+            except OSError as e:
+                raise StateError(display, f"could not be read ({_why(e)})") from e
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > limit:
+            raise StateError(display, f"grew past the {limit} byte limit while being read")
+        try:
+            return bytes(data).decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise StateError(display, "is not valid UTF-8") from e
+    finally:
+        os.close(fd)
+
+
+def write_bounded(handle, name, data, mode=FILE_MODE):
+    """Atomic, dirfd-relative, no-follow write: temp -> fsync -> rename -> fsync(dir)."""
+    dirfd = handle.fd
+    display = os.path.join(handle.path, name)
+    tmp = f".tmp-{name}.{os.getpid():d}.{os.urandom(4).hex()}"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     mode, dir_fd=dirfd)
+    except OSError as e:
+        raise StateError(display, f"could not be written ({_why(e)})") from e
+
+    def cleanup(open_fd):
+        if open_fd is not None:
+            try:
+                os.close(open_fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+
+    try:
+        os.fchmod(fd, mode)  # umask must never widen (or narrow) private state
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    except OSError as e:
+        cleanup(fd)
+        raise StateError(display, f"could not be written ({_why(e)})") from e
+    except BaseException:
+        cleanup(fd)
+        raise
+    try:
+        os.fsync(dirfd)
+    except OSError:
+        pass
+
+
+def write_json_at(handle, name, obj, mode=FILE_MODE):
+    data = (json.dumps(obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    write_bounded(handle, name, data, mode)
+
+
+def unlink_at(handle, name):
+    """os.unlink never follows the final symlink, and dir_fd pins the directory."""
+    try:
+        os.unlink(name, dir_fd=handle.fd)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise StateError(os.path.join(handle.path, name), f"could not be removed ({_why(e)})") from e
+
+
+def _rmtree_at(parent_fd, name, display):
+    try:
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise StateError(display, _bad_dir_reason(parent_fd, name, e)) from e
+    try:
+        try:
+            entries = os.listdir(fd)
+        except OSError as e:
+            raise StateError(display, f"could not be listed ({_why(e)})") from e
+        for entry in entries:
+            child = os.path.join(display, entry)
+            try:
+                st = os.lstat(entry, dir_fd=fd)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                raise StateError(child, f"could not be inspected ({_why(e)})") from e
+            if stat.S_ISDIR(st.st_mode):
+                _rmtree_at(fd, entry, child)
+            else:
+                try:
+                    os.unlink(entry, dir_fd=fd)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    raise StateError(child, f"could not be removed ({_why(e)})") from e
+    finally:
+        os.close(fd)
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError as e:
+        raise StateError(display, f"could not be removed ({_why(e)})") from e
+    return True
+
+
+# convenience wrappers: one verified walk per operation
+
+def read_state_file(name, limit):
+    with state_handle() as h:
+        return read_bounded(h.fd, name, limit, os.path.join(h.path, name))
+
+
+def write_state_file(name, obj):
+    with state_handle() as h:
+        write_json_at(h, name, obj)
+
+
+def read_cache_file(pid):
+    with cache_handle() as h:
+        return read_bounded(h.fd, f"{pid}.json", LIMIT_CACHE, os.path.join(h.path, f"{pid}.json"))
+
+
+def write_cache_file(pid, obj):
+    with cache_handle() as h:
+        write_json_at(h, f"{pid}.json", obj)
+
+
+def json_or_none(text):
+    """Parse text that we already know came from a verified file; None on malformed JSON."""
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+# ---------- time / small helpers ----------
 
 def utcnow():
     return datetime.now(timezone.utc)
@@ -159,33 +538,6 @@ def jload_dict(body):
     return obj
 
 
-def atomic_write_json(path, obj, secret=False):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
-    try:
-        # mkstemp files are already 0600; secrets must never widen
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        if secret:
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def read_json(path):
-    p = Path(path)
-    if not p.exists():
-        return None
-    return json.loads(p.read_text(encoding="utf-8"))
-
-
 # ---------- config / secrets ----------
 
 def default_config():
@@ -259,14 +611,15 @@ def _config_value_error(merged):
 
 def load_config():
     d = default_config()
-    p = config_path()
-    if not p.exists():
+    # StateError (unsafe path) propagates: callers turn it into the documented error snapshot.
+    text = read_state_file("config.json", LIMIT_CONFIG)
+    if text is None:
         return d, None
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(text)
         if not isinstance(raw, dict):
             raise ValueError("config.json is not a JSON object")
-    except (OSError, ValueError) as e:
+    except ValueError as e:
         return None, str(e)
     rt = raw.get("thresholds")
     if rt is not None and not isinstance(rt, dict):
@@ -296,20 +649,19 @@ def load_config():
 
 
 def load_raw_config():
-    p = config_path()
-    if not p.exists():
+    text = read_state_file("config.json", LIMIT_CONFIG)
+    if text is None:
         return {}
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(text)
         return raw if isinstance(raw, dict) else {}
-    except (OSError, ValueError):
+    except ValueError:
         print("error: config.json is unreadable or malformed", file=sys.stderr)
         sys.exit(2)
 
 
 def save_config(raw):
-    ensure_dirs()
-    atomic_write_json(config_path(), raw)
+    write_state_file("config.json", raw)
 
 
 def parse_thresholds(cfg):
@@ -327,23 +679,22 @@ def secrets_path():
 
 
 def load_secrets():
-    p = secrets_path()
-    if not p.exists():
+    text = read_state_file("secrets.json", LIMIT_SECRETS)
+    if text is None:
         return {}
     try:
-        obj = json.loads(p.read_text(encoding="utf-8"))
+        obj = json.loads(text)
         if not isinstance(obj, dict):
             raise ValueError("secrets.json is not a JSON object")
         return obj
-    except (OSError, ValueError) as e:
+    except ValueError as e:
         print(f"error: secrets.json unreadable: {e}", file=sys.stderr)
         sys.exit(2)
 
 
 def save_secrets(secrets):
-    ensure_dirs()
-    atomic_write_json(secrets_path(), secrets, secret=True)
-    os.chmod(secrets_path(), 0o600)
+    # 0600 inside a 0700 dir, enforced by write_bounded's fchmod (umask cannot widen it)
+    write_state_file("secrets.json", secrets)
 
 
 # ---------- HTTP ----------
@@ -868,15 +1219,12 @@ def cache_path(pid):
 
 
 def load_cache(pid):
-    try:
-        obj = read_json(cache_path(pid))
-        return obj if isinstance(obj, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    obj = json_or_none(read_cache_file(pid))
+    return obj if isinstance(obj, dict) else {}
 
 
 def save_cache(pid, cache):
-    atomic_write_json(cache_path(pid), cache)
+    write_cache_file(pid, cache)
 
 
 def compute_due(cache, now, ttl):
@@ -920,10 +1268,11 @@ def row_from_cache(pid, cache, now):
 def write_record(pid, rec):
     if rec.get("id") != pid:
         raise AssertionError(f"record id {rec.get('id')!r} != filename stem {pid!r}")
-    path = agents_dir() / f"{pid}.json"
-    if path.stem != rec["id"]:
+    name = f"{pid}.json"
+    if Path(name).stem != rec["id"]:
         raise AssertionError("record id does not match filename stem")
-    atomic_write_json(path, rec)
+    with agents_handle() as h:
+        write_json_at(h, name, rec)
 
 
 def notify(pid, severity):
@@ -941,12 +1290,8 @@ def notify(pid, severity):
 
 
 def process_alerts(rows):
-    path = state_dir() / "alerts.json"
-    try:
-        prev = read_json(path) or {}
-        if not isinstance(prev, dict):
-            prev = {}
-    except (OSError, ValueError):
+    prev = json_or_none(read_state_file("alerts.json", LIMIT_ALERTS))
+    if not isinstance(prev, dict):
         prev = {}
     order = {"low": 1, "critical": 2}
     cur = {}
@@ -960,22 +1305,89 @@ def process_alerts(rows):
         elif sev == "unknown" and pid in prev:
             cur[pid] = prev[pid]
         # severity "ok" drops the entry: recovery re-arms notification
-    atomic_write_json(path, cur)
+    write_state_file("alerts.json", cur)
+
+
+class _Lock:
+    """flock on a no-follow lock file, holding its verified dirfd for the lock's lifetime."""
+
+    def __init__(self, fd, handle):
+        self.fd = fd
+        self.handle = handle
+
+    def fileno(self):
+        return self.fd
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        self.handle.close()
 
 
 def acquire_lock():
-    ensure_dirs()
-    fh = open(state_dir() / "lock", "a")
+    h = verified_dir([(PLUGIN_ID, True)])
+    display = os.path.join(h.path, "lock")
+    try:
+        fd = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     FILE_MODE, dir_fd=h.fd)
+    except OSError as e:
+        h.close()
+        if e.errno == errno.ELOOP:
+            raise StateError(display, "is a symlink, not a regular file") from e
+        raise StateError(display, f"cannot be opened safely ({_why(e)})") from e
+    lock = _Lock(fd, h)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise StateError(display, "is not a regular file")
+        if st.st_uid != os.geteuid():
+            raise StateError(display, f"is owned by uid {st.st_uid}, not by this user")
+        if stat.S_IMODE(st.st_mode) != FILE_MODE:
+            try:
+                os.fchmod(fd, FILE_MODE)
+            except OSError as e:
+                raise StateError(display, f"mode could not be repaired to 0600 ({_why(e)})") from e
+    except BaseException:
+        lock.close()
+        raise
     deadline = time.monotonic() + LOCK_WAIT
     while True:
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fh
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
         except OSError:
             if time.monotonic() >= deadline:
-                fh.close()
+                lock.close()
                 return None
             time.sleep(0.25)
+
+
+class LockBusy(Exception):
+    """Another omacash run holds the state lock; we refuse rather than write a stale document."""
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Hold the flock across a read-modify-write of a whole state document.
+
+    `key set/clear`, `ledger set/add` and `setup` rewrite all of secrets.json / config.json, so a
+    split read and write can drop the other writer's edit. The body must be short and must never
+    wait on a human: flock is per open file description, so taking this twice in one process (or
+    nesting it inside `sync`'s own lock) would wait on ourselves until LOCK_WAIT expires.
+    """
+    lock = acquire_lock()
+    if lock is None:
+        raise LockBusy()
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock.close()
 
 
 def snapshot_path():
@@ -990,26 +1402,44 @@ def exit_code_for(rows):
 
 
 def clear_provider_state(pid):
-    for p in (cache_path(pid), agents_dir() / f"{pid}.json"):
-        try:
-            p.unlink(missing_ok=True)
-        except OSError:
-            pass
+    with cache_handle() as h:
+        unlink_at(h, f"{pid}.json")
+    with agents_handle() as h:
+        unlink_at(h, f"{pid}.json")
+
+
+STATE_ERROR_HINT = "Remove that path or restore it to a directory/file you own with mode 0700/0600"
+
+
+def _config_error_snapshot(message, hint):
+    now = utcnow()
+    err = {"kind": "config", "message": message, "hint": hint}
+    return build_snapshot([error_row(pid, err, iso(now)) for pid in PROVIDERS], now)
+
+
+def _state_error_snapshot(e):
+    return _config_error_snapshot(f"unsafe state path: {e}", STATE_ERROR_HINT)
 
 
 def _config_error_exit(message, hint):
-    now = utcnow()
-    err = {"kind": "config", "message": message, "hint": hint}
-    rows = [error_row(pid, err, iso(now)) for pid in PROVIDERS]
-    snap = build_snapshot(rows, now)
-    atomic_write_json(snapshot_path(), snap)
+    snap = _config_error_snapshot(message, hint)
+    try:
+        write_state_file("snapshot.json", snap)
+    except (StateError, OSError):
+        pass  # the state dir itself is unusable — the panel still gets the problem on stdout
     print(json.dumps(snap, indent=2))
     return 2
+
+
+def _state_error_exit(e):
+    return _config_error_exit(f"unsafe state path: {e}", STATE_ERROR_HINT)
 
 
 def cmd_sync(args):
     try:
         return _cmd_sync(args)
+    except StateError as e:
+        return _state_error_exit(e)
     except Exception as e:  # noqa: BLE001 — sync must never traceback; degrade to a config snapshot
         try:
             return _config_error_exit(f"internal error: {type(e).__name__}: {e}",
@@ -1031,12 +1461,8 @@ def _cmd_sync(args):
 
     lock = acquire_lock()
     if lock is None:
-        snap = None
-        try:
-            snap = read_json(snapshot_path())
-        except (OSError, ValueError):
-            pass
-        if snap is None:
+        snap = json_or_none(read_state_file("snapshot.json", LIMIT_SNAPSHOT))
+        if not isinstance(snap, dict):
             snap = build_snapshot([], now)
         print(json.dumps(snap, indent=2))
         return exit_code_for(snap.get("providers") or [])
@@ -1085,7 +1511,7 @@ def _cmd_sync(args):
                 records[pid] = rec
 
         snap = build_snapshot(rows, now)
-        atomic_write_json(snapshot_path(), snap)
+        write_state_file("snapshot.json", snap)
         for pid, rec in records.items():
             write_record(pid, rec)
         process_alerts(rows)
@@ -1102,9 +1528,15 @@ def _cmd_sync(args):
 # ---------- other commands ----------
 
 def cmd_status(args):
-    p = snapshot_path()
-    if p.exists():
-        sys.stdout.write(p.read_text(encoding="utf-8"))
+    try:
+        text = read_state_file("snapshot.json", LIMIT_SNAPSHOT)
+    except StateError as e:
+        # `status` reports an unsafe path, it never repairs one: printing the error snapshot is
+        # what the panel needs, and writing it would replace the very file the user must inspect.
+        print(json.dumps(_state_error_snapshot(e), indent=2))
+        return 2
+    if text is not None:
+        sys.stdout.write(text)
         return 0
     print(json.dumps({
         "schemaVersion": 1,
@@ -1123,37 +1555,48 @@ def read_key_input(prompt):
     return sys.stdin.read().strip()
 
 
+def store_key(pid, key):
+    """Add one key to secrets.json. The read and the write share one lock, or a key is lost."""
+    with state_lock():
+        secrets = load_secrets()
+        secrets[pid] = key
+        save_secrets(secrets)
+        with cache_handle() as h:
+            unlink_at(h, f"{pid}.json")
+
+
+def clear_key(pid):
+    with state_lock():
+        secrets = load_secrets()
+        secrets.pop(pid, None)
+        save_secrets(secrets)
+    clear_provider_state(pid)
+
+
 def cmd_key(args):
     if args.action == "list":
         secrets = load_secrets()
         print(json.dumps({pid: bool(secrets.get(pid)) for pid in PROVIDERS}, indent=2))
         return 0
     pid = args.provider
-    secrets = load_secrets()
     if args.action == "set":
+        # read the key before taking the lock: the lock must never be held across a human
         key = read_key_input(f"{NAMES[pid]} API key: ")
         if not key:
             print("error: empty key", file=sys.stderr)
             return 1
-        secrets[pid] = key
-        save_secrets(secrets)
-        try:
-            cache_path(pid).unlink(missing_ok=True)
-        except OSError:
-            pass
+        store_key(pid, key)
         print(f"key stored for {pid}")
         return 0
     if args.action == "clear":
-        secrets.pop(pid, None)
-        save_secrets(secrets)
-        clear_provider_state(pid)
+        clear_key(pid)
         print(f"key cleared for {pid}")
         return 0
     return 1
 
 
-def _set_ledger_entries(pid, entries):
-    raw = load_raw_config()
+def _store_ledger(raw, pid, entries):
+    """Write the ledger and reset the provider's cache. The caller must hold the state lock."""
     raw.setdefault("providers", {}).setdefault(pid, {}).setdefault("ledger", {})["entries"] = entries
     save_config(raw)
     cache = load_cache(pid)
@@ -1162,6 +1605,23 @@ def _set_ledger_entries(pid, entries):
         cache["lastError"] = None
         cache.pop("lastAttempt", None)
         save_cache(pid, cache)
+
+
+def _set_ledger_entries(pid, entries):
+    """Replace the ledger; config.json is rewritten whole, so the write is locked."""
+    with state_lock():
+        _store_ledger(load_raw_config(), pid, entries)
+
+
+def _add_ledger_entry(pid, entry):
+    """Append one entry. Reading the current entries is inside the lock, so none is dropped."""
+    with state_lock():
+        raw = load_raw_config()
+        pcfg = (raw.get("providers") or {}).get(pid)
+        entries = list(ledger_entries(pcfg if isinstance(pcfg, dict) else {}))
+        entries.append(entry)
+        _store_ledger(raw, pid, entries)
+    return entries
 
 
 def cmd_ledger(args):
@@ -1202,13 +1662,11 @@ def cmd_ledger(args):
         except (InvalidOperation, ValueError):
             print("error: --amount must be a decimal amount, --date must be YYYY-MM-DD", file=sys.stderr)
             return 1
-        cfg, cfg_err = load_config()
+        _, cfg_err = load_config()
         if cfg_err is not None:
             print("error: config.json is malformed", file=sys.stderr)
             return 2
-        entries = list(ledger_entries(cfg["providers"][pid]))
-        entries.append({"date": d.isoformat(), "amount": fmt_money(amount)})
-        _set_ledger_entries(pid, entries)
+        entries = _add_ledger_entry(pid, {"date": d.isoformat(), "amount": fmt_money(amount)})
         funded, since = ledger_funded_since(entries)
         print(f"ledger for {pid}: funded ${fmt_money(funded)} since {since.isoformat()}")
         return 0
@@ -1364,12 +1822,8 @@ def cmd_setup(args):
                 print(f"  live test OK: {usage_text_for(pid, norm)}")
             else:
                 print(f"  live test OK ({warn})")
+            store_key(pid, key)
             secrets[pid] = key
-            save_secrets(secrets)
-            try:
-                cache_path(pid).unlink(missing_ok=True)
-            except OSError:
-                pass
             print("  key saved")
             if pid == "anthropic-api":
                 confirm_cents(key, interactive=True)
@@ -1385,15 +1839,15 @@ def cmd_setup(args):
 
 def cmd_cleanup(args):
     removed = []
-    for pid in PROVIDERS:
-        p = agents_dir() / f"{pid}.json"
-        if p.exists():
-            p.unlink()
-            removed.append(str(p))
-    sd = state_dir()
-    if sd.exists():
-        shutil.rmtree(sd)
-        removed.append(str(sd))
+    with agents_handle() as h:
+        for pid in PROVIDERS:
+            if unlink_at(h, f"{pid}.json"):
+                removed.append(os.path.join(h.path, f"{pid}.json"))
+    # walk to the verified shared parent, then delete our own tree dirfd-relative
+    with verified_dir([]) as parent:
+        display = os.path.join(parent.path, PLUGIN_ID)
+        if _rmtree_at(parent.fd, PLUGIN_ID, display):
+            removed.append(display)
     for path in removed:
         print(f"removed {path}")
     if not removed:
@@ -1845,6 +2299,435 @@ def run_selftest():
             rc = cmd_sync(argparse.Namespace(force=False, provider=None))
         return rc, json.loads(buf.getvalue())
 
+    def expect_state_error(fn, needle, what):
+        try:
+            fn()
+        except StateError as e:
+            assert needle in e.reason, (what, e.reason)
+            return e
+        raise AssertionError(f"expected StateError ({what})")
+
+    def mode_of(p):
+        return stat.S_IMODE(os.lstat(p).st_mode)
+
+    # -- state dir: fresh chain, modes, and umask independence
+    def t_fresh_state_chain():
+        _, restore = isolated_state()
+        old_umask = os.umask(0o000)
+        try:
+            rc, snap = run_sync()  # no secrets.json: every provider unconfigured, no network
+            assert rc == 0, rc
+            assert all(r["status"] == "unconfigured" for r in snap["providers"])
+            for d in (state_dir(), cache_dir()):
+                assert mode_of(d) == 0o700, (d, oct(mode_of(d)))
+            for f in (snapshot_path(), state_dir() / "alerts.json", state_dir() / "lock"):
+                assert mode_of(f) == 0o600, (f, oct(mode_of(f)))
+            save_secrets({"openrouter": "k"})
+            save_config({"refreshIntervalSec": 300})
+            save_cache("openrouter", {"failCount": 0})
+            assert mode_of(secrets_path()) == 0o600      # a wide umask must not widen secrets
+            assert mode_of(config_path()) == 0o600
+            assert mode_of(cache_path("openrouter")) == 0o600
+            assert load_secrets() == {"openrouter": "k"}
+            assert load_cache("openrouter") == {"failCount": 0}
+            assert json.loads(read_state_file("snapshot.json", LIMIT_SNAPSHOT))["schemaVersion"] == 1
+            os.chmod(state_dir(), 0o750)                 # drift is repaired on the next walk
+            ensure_dirs()
+            assert mode_of(state_dir()) == 0o700
+        finally:
+            os.umask(old_umask)
+            restore()
+    t("state dir: 0700 chain, 0600 files, umask-proof, drift repaired", t_fresh_state_chain)
+
+    # -- a symlinked path component is never followed
+    def t_state_component_symlink():
+        for depth in ("plugin", "shared"):
+            td, restore = isolated_state()
+            try:
+                ensure_dirs()
+                elsewhere = td / "elsewhere"
+                elsewhere.mkdir(mode=0o700)
+                victim = state_dir() if depth == "plugin" else state_home() / "omarchy"
+                shutil.rmtree(victim)
+                os.symlink(elsewhere, victim)
+                for what, fn in (("ensure_dirs", ensure_dirs), ("load_config", load_config),
+                                 ("load_secrets", load_secrets), ("save_config", lambda: save_config({}))):
+                    e = expect_state_error(fn, "symlink", f"{depth} component / {what}")
+                    assert e.path.endswith(str(victim).split("/")[-1]), e.path
+                # sync degrades to the documented config snapshot, exit 2, no traceback
+                rc, snap = run_sync()
+                assert rc == 2, rc
+                assert len(snap["providers"]) == len(PROVIDERS)
+                for r in snap["providers"]:
+                    assert r["status"] == "error" and r["error"]["kind"] == "config", r
+                assert "unsafe state path" in snap["providers"][0]["error"]["message"]
+                assert not (elsewhere / "config.json").exists()  # nothing was written through it
+            finally:
+                restore()
+    t("symlinked state-dir component rejected (plugin + shared)", t_state_component_symlink)
+
+    # -- a symlinked file is an error, never a silent "missing"
+    def t_state_file_symlink():
+        td, restore = isolated_state()
+        try:
+            ensure_dirs()
+            outside = td / "outside.json"
+            outside.write_text('{"refreshIntervalSec": 30}\n')
+            for name in ("config.json", "secrets.json", "snapshot.json", "alerts.json"):
+                os.symlink(outside, state_dir() / name)
+            os.symlink(outside, cache_dir() / "openrouter.json")
+            with state_handle() as h:
+                for name in ("config.json", "secrets.json", "snapshot.json", "alerts.json"):
+                    expect_state_error(lambda n=name: read_bounded(h.fd, n, LIMIT_CONFIG),
+                                       "symlink", name)
+            for what, fn in (("load_config", load_config), ("load_secrets", load_secrets),
+                             ("load_raw_config", load_raw_config),
+                             ("load_cache", lambda: load_cache("openrouter"))):
+                expect_state_error(fn, "symlink", what)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cmd_status(None)
+            assert rc == 2, rc
+            snap = json.loads(buf.getvalue())
+            assert snap["providers"][0]["error"]["kind"] == "config"
+            assert "unsafe state path" in snap["providers"][0]["error"]["message"]
+            rc2, snap2 = run_sync()
+            assert rc2 == 2, rc2
+            assert snap2["providers"][0]["error"]["kind"] == "config"
+            assert outside.read_text() == '{"refreshIntervalSec": 30}\n'  # never written through
+        finally:
+            restore()
+    t("symlinked config/secrets/snapshot/alerts/cache rejected, not ignored", t_state_file_symlink)
+
+    # -- status reports an unsafe snapshot, it never repairs one (sync still does)
+    def t_status_never_writes():
+        td, restore = isolated_state()
+        try:
+            ensure_dirs()
+            outside = td / "outside.json"
+            outside.write_text("keep me\n")
+            os.symlink(outside, snapshot_path())
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cmd_status(None)
+            assert rc == 2, rc
+            snap = json.loads(buf.getvalue())          # the panel still gets valid JSON on stdout
+            assert len(snap["providers"]) == len(PROVIDERS)
+            assert snap["providers"][0]["error"]["kind"] == "config"
+            assert "unsafe state path" in snap["providers"][0]["error"]["message"]
+            assert stat.S_ISLNK(os.lstat(snapshot_path()).st_mode), "status replaced the symlink"
+            assert outside.read_text() == "keep me\n"
+            assert not [n for n in os.listdir(state_dir()) if n.startswith(".tmp-")]
+            # sync's write behavior is unchanged: it replaces the link with a real 0600 snapshot
+            rc2, _ = run_sync()
+            assert rc2 == 0, rc2
+            assert not stat.S_ISLNK(os.lstat(snapshot_path()).st_mode)
+            assert mode_of(snapshot_path()) == 0o600
+            assert outside.read_text() == "keep me\n"
+        finally:
+            restore()
+    t("status is read-only: prints the error snapshot, writes nothing", t_status_never_writes)
+
+    # -- non-regular files in place of state files
+    def t_nonregular_state_file():
+        _, restore = isolated_state()
+        try:
+            ensure_dirs()
+            os.mkfifo(state_dir() / "config.json", 0o600)   # must not block on open()
+            (state_dir() / "secrets.json").mkdir(mode=0o700)
+            expect_state_error(load_config, "not a regular file", "FIFO config.json")
+            expect_state_error(load_secrets, "not a regular file", "dir secrets.json")
+            rc, snap = run_sync()
+            assert rc == 2, rc
+            assert snap["providers"][0]["error"]["kind"] == "config"
+            # a file where a directory belongs is refused too
+            (state_dir() / "cache").rmdir()
+            (state_dir() / "cache").write_text("not a dir")
+            expect_state_error(ensure_dirs, "not a directory", "regular file as cache dir")
+        finally:
+            restore()
+    t("FIFO / directory / file-as-dir in place of state files rejected", t_nonregular_state_file)
+
+    # -- size bounds
+    def t_size_bounds():
+        _, restore = isolated_state()
+        try:
+            ensure_dirs()
+            (state_dir() / "secrets.json").write_text("x" * (LIMIT_SECRETS + 1))
+            expect_state_error(load_secrets, "larger than", "oversize secrets.json")
+            (state_dir() / "config.json").write_text("x" * (LIMIT_CONFIG + 1))
+            expect_state_error(load_config, "larger than", "oversize config.json")
+            rc, snap = run_sync()
+            assert rc == 2, rc
+            assert snap["providers"][0]["error"]["kind"] == "config"
+
+            class ShrunkStat:  # a file that lies about its size, i.e. one that is growing
+                st_size = 0
+
+                def __init__(self, st):
+                    self._st = st
+
+                def __getattr__(self, k):
+                    return getattr(self._st, k)
+
+            (state_dir() / "grow.json").write_text("y" * 100)
+            with state_handle() as h:
+                real_fstat = os.fstat
+                os.fstat = lambda fd: ShrunkStat(real_fstat(fd))
+                try:
+                    expect_state_error(lambda: read_bounded(h.fd, "grow.json", 10),
+                                       "grew past", "growing file")
+                finally:
+                    os.fstat = real_fstat
+            # non-UTF-8 content is refused rather than silently mangled
+            with open(state_dir() / "config.json", "wb") as f:
+                f.write(b"\xff\xfe{}")
+            expect_state_error(load_config, "not valid UTF-8", "binary config.json")
+        finally:
+            restore()
+    t("oversize / growing / non-UTF-8 state files rejected", t_size_bounds)
+
+    # -- owner check (a non-root test can only prove it by moving the goalposts)
+    def t_owner_check():
+        _, restore = isolated_state()
+        real_geteuid = os.geteuid
+
+        def other_uid():
+            return real_geteuid() + 4242
+
+        try:
+            ensure_dirs()
+            save_config({"refreshIntervalSec": 300})
+            with state_handle() as h:
+                os.geteuid = other_uid
+                try:
+                    expect_state_error(lambda: read_bounded(h.fd, "config.json", LIMIT_CONFIG),
+                                       "owned by uid", "file fstat uid check")
+                finally:
+                    os.geteuid = real_geteuid
+            os.geteuid = other_uid
+            try:
+                expect_state_error(ensure_dirs, "owned by uid", "dir fstat uid check")
+                rc, snap = run_sync()
+                assert rc == 2, rc
+                assert snap["providers"][0]["error"]["kind"] == "config"
+                assert "owned by uid" in snap["providers"][0]["error"]["message"]
+            finally:
+                os.geteuid = real_geteuid
+        finally:
+            os.geteuid = real_geteuid
+            restore()
+    t("wrong-owner directory and file rejected (fstat uid enforced)", t_owner_check)
+
+    # -- writable-by-others directories
+    def t_writable_dir_rejected():
+        _, restore = isolated_state()
+        try:
+            ensure_dirs()
+            for mode in (0o707, 0o770, 0o777):
+                os.chmod(state_dir(), mode)
+                expect_state_error(load_config, "writable", f"state dir {mode:o}")
+                rc, snap = run_sync()
+                assert rc == 2, (mode, rc)
+                assert snap["providers"][0]["error"]["kind"] == "config"
+            os.chmod(state_dir(), 0o700)
+            shared = state_home() / "omarchy"
+            os.chmod(shared, 0o777)
+            expect_state_error(ensure_dirs, "writable", "shared omarchy dir 777")
+            os.chmod(shared, 0o700)
+            assert load_config()[1] is None  # still fine once the mode is repaired
+        finally:
+            restore()
+    t("group/world-writable state dir rejected", t_writable_dir_rejected)
+
+    # -- agents records dir is shared with Omarchy: same owner, but its mode is not ours to force
+    def t_agents_dir_policy():
+        td, restore = isolated_state()
+        try:
+            ensure_dirs()
+            ad = agents_dir()
+            os.chmod(ad, 0o755)
+            write_record("openrouter", {"id": "openrouter"})
+            assert mode_of(ad) == 0o755, oct(mode_of(ad))       # left exactly as Omarchy had it
+            assert mode_of(ad / "openrouter.json") == 0o600
+            os.chmod(ad, 0o775)
+            expect_state_error(lambda: write_record("openrouter", {"id": "openrouter"}),
+                               "writable", "group-writable agents dir")
+            os.chmod(ad, 0o755)
+            shutil.rmtree(ad)
+            elsewhere = td / "agents-elsewhere"
+            elsewhere.mkdir(mode=0o700)
+            os.symlink(elsewhere, ad)
+            expect_state_error(lambda: write_record("openrouter", {"id": "openrouter"}),
+                               "symlink", "symlinked usage dir")
+            assert not (elsewhere / "openrouter.json").exists()
+            os.unlink(ad)
+            ensure_dirs()
+            write_record("openrouter", {"id": "openrouter"})
+            assert (ad / "openrouter.json").exists()
+        finally:
+            restore()
+    t("agents usage dir: same-owner + not writable by others, mode untouched", t_agents_dir_policy)
+
+    # -- atomic write cleans its temp up on failure
+    def t_atomic_write_cleanup():
+        _, restore = isolated_state()
+        try:
+            ensure_dirs()
+            save_config({"refreshIntervalSec": 300})
+            before = sorted(os.listdir(state_dir()))
+            real_replace = os.replace
+
+            def boom(*a, **k):
+                raise OSError(errno.EIO, "injected write failure")
+
+            os.replace = boom
+            try:
+                expect_state_error(lambda: save_config({"refreshIntervalSec": 999}),
+                                   "could not be written", "failed atomic write")
+                expect_state_error(lambda: save_secrets({"openrouter": "k"}),
+                                   "could not be written", "failed secrets write")
+            finally:
+                os.replace = real_replace
+            after = sorted(os.listdir(state_dir()))
+            assert after == before, (before, after)
+            assert not [n for n in after if n.startswith(".tmp-")], after
+            cfg, err = load_config()
+            assert err is None and cfg["refreshIntervalSec"] == 300  # old content intact
+        finally:
+            restore()
+    t("atomic write leaves no temp file behind on failure", t_atomic_write_cleanup)
+
+    # -- cleanup / key clear go through no-follow dirfd deletes
+    def t_dirfd_deletes():
+        td, restore = isolated_state()
+        try:
+            ensure_dirs()
+            save_secrets({"openrouter": "k"})
+            save_cache("openrouter", {"failCount": 0})
+            write_record("openrouter", {"id": "openrouter"})
+            outside = td / "precious.json"
+            outside.write_text("keep me")
+            os.symlink(outside, cache_dir() / "vercel-ai.json")
+            os.symlink(outside, agents_dir() / "vercel-ai.json")
+            clear_provider_state("vercel-ai")           # unlinks the links, not the targets
+            assert outside.read_text() == "keep me"
+            assert not (cache_dir() / "vercel-ai.json").exists()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cmd_cleanup(None)
+            assert rc == 0, rc
+            assert not state_dir().exists()
+            assert not (agents_dir() / "openrouter.json").exists()
+            assert outside.read_text() == "keep me"
+            assert agents_dir().exists()                # Omarchy's own dir is left in place
+        finally:
+            restore()
+    t("cleanup / clear delete through dirfd, never through a symlink", t_dirfd_deletes)
+
+    # -- an undeletable state tree is a StateError, never a PermissionError traceback
+    def t_cleanup_refuses_cleanly():
+        _, restore = isolated_state()
+        try:
+            ensure_dirs()
+            save_cache("openrouter", {"failCount": 0})
+            write_state_file("alerts.json", {})
+            for victim in (cache_dir(), state_dir()):
+                os.chmod(victim, 0o500)                 # readable and searchable, but not writable
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        e = expect_state_error(lambda: cmd_cleanup(None),
+                                               "could not be removed", f"0500 {victim.name}")
+                    assert e.path.startswith(str(victim)), (e.path, victim)
+                finally:
+                    os.chmod(victim, 0o700)
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert cmd_cleanup(None) == 0           # recovers once the mode is fixed
+            assert not state_dir().exists()
+        finally:
+            restore()
+    t("cleanup on an undeletable tree -> StateError, not a traceback", t_cleanup_refuses_cleanly)
+
+    # -- a failed mode repair is a StateError too (a read-only mount, simulated)
+    def t_mode_repair_failure():
+        _, restore = isolated_state()
+        real_fchmod = os.fchmod
+
+        def refuse(fd, mode):
+            raise OSError(errno.EROFS, "Read-only file system")
+
+        try:
+            ensure_dirs()
+            (state_dir() / "lock").write_text("")
+            os.chmod(state_dir() / "lock", 0o644)       # drifted mode -> acquire_lock repairs it
+            os.chmod(state_dir(), 0o750)                # drifted mode -> the walk repairs it
+            os.fchmod = refuse
+            expect_state_error(ensure_dirs, "Read-only file system", "state dir mode repair")
+            os.fchmod = real_fchmod
+            os.chmod(state_dir(), 0o700)
+            os.fchmod = refuse
+            expect_state_error(acquire_lock, "Read-only file system", "lock mode repair")
+        finally:
+            os.fchmod = real_fchmod
+            restore()
+    t("failed 0700/0600 mode repair surfaces as StateError", t_mode_repair_failure)
+
+    # -- key/ledger read-modify-writes hold the lock for the whole read and write
+    def t_key_ledger_locked():
+        _, restore = isolated_state()
+        old_wait = globals()["LOCK_WAIT"]
+        real_load_secrets = globals()["load_secrets"]
+        real_load_raw = globals()["load_raw_config"]
+        reads = []
+        try:
+            ensure_dirs()
+            save_secrets({"openrouter": "a"})
+            globals()["LOCK_WAIT"] = 0                  # do not sit out the real 15 s in a test
+            globals()["load_secrets"] = lambda: reads.append("secrets") or real_load_secrets()
+            globals()["load_raw_config"] = lambda: reads.append("config") or real_load_raw()
+            held = acquire_lock()
+            assert held is not None
+            try:
+                for what, fn in (
+                    ("key set", lambda: store_key("vercel-ai", "b")),
+                    ("key clear", lambda: clear_key("openrouter")),
+                    ("ledger set", lambda: _set_ledger_entries(
+                        "openai-api", [{"date": "2026-08-01", "amount": "60.00"}])),
+                    ("ledger add", lambda: _add_ledger_entry(
+                        "openai-api", {"date": "2026-08-02", "amount": "5.00"})),
+                ):
+                    try:
+                        fn()
+                        raise AssertionError(f"expected LockBusy ({what})")
+                    except LockBusy:
+                        pass
+                # refused before reading, so no stale document can be saved, and nothing changed
+                assert reads == [], reads
+                assert real_load_secrets() == {"openrouter": "a"}
+                assert real_load_raw() == {}
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                held.close()
+            reads.clear()
+            store_key("vercel-ai", "b")                 # lock released -> the writes go through
+            _set_ledger_entries("openai-api", [{"date": "2026-08-01", "amount": "60.00"}])
+            entries = _add_ledger_entry("openai-api", {"date": "2026-08-02", "amount": "5.00"})
+            assert reads == ["secrets", "config", "config"], reads
+            assert real_load_secrets() == {"openrouter": "a", "vercel-ai": "b"}
+            assert [e["amount"] for e in entries] == ["60.00", "5.00"]
+            assert ledger_funded_since(entries)[0] == dec("65.00")
+            clear_key("openrouter")
+            assert real_load_secrets() == {"vercel-ai": "b"}
+            free = acquire_lock()                       # every path released what it took
+            assert free is not None
+            free.close()
+        finally:
+            globals()["LOCK_WAIT"] = old_wait
+            globals()["load_secrets"] = real_load_secrets
+            globals()["load_raw_config"] = real_load_raw
+            restore()
+    t("key/ledger writes hold the lock and refuse cleanly when it is busy", t_key_ledger_locked)
+
     # -- config value validation
     def t_config_validation():
         cases = [
@@ -1875,11 +2758,11 @@ def run_selftest():
         _, restore = isolated_state()
         try:
             for raw, needle in cases:
-                atomic_write_json(config_path(), raw)
+                save_config(raw)
                 cfg, err = load_config()
                 assert cfg is None and err and needle in err, (raw, err)
-            atomic_write_json(config_path(), {"thresholds": {"lowUsd": "12.5", "lowPercent": 0.25},
-                                              "providers": {"openrouter": {"enabled": False}}})
+            save_config({"thresholds": {"lowUsd": "12.5", "lowPercent": 0.25},
+                         "providers": {"openrouter": {"enabled": False}}})
             cfg, err = load_config()
             assert err is None and cfg["thresholds"]["lowUsd"] == "12.5"
             assert cfg["providers"]["openrouter"]["enabled"] is False
@@ -1892,7 +2775,7 @@ def run_selftest():
         for raw in ({"thresholds": {"lowUsd": "ten"}}, {"thresholds": {"lowPercent": None}}):
             _, restore = isolated_state()
             try:
-                atomic_write_json(config_path(), raw)
+                save_config(raw)
                 rc, snap = run_sync()
                 assert rc == 2, rc
                 assert len(snap["providers"]) == len(PROVIDERS)
@@ -1900,7 +2783,7 @@ def run_selftest():
                     assert r["status"] == "error" and r["error"]["kind"] == "config"
                 key = "lowUsd" if "lowUsd" in raw["thresholds"] else "lowPercent"
                 assert key in snap["providers"][0]["error"]["message"]
-                assert json.loads((state_dir() / "snapshot.json").read_text())["providers"]
+                assert json.loads(read_state_file("snapshot.json", LIMIT_SNAPSHOT))["providers"]
             finally:
                 restore()
     t("sync on bad config values -> config snapshot + exit 2", t_config_error_snapshot)
@@ -1930,11 +2813,11 @@ def run_selftest():
         _, restore = isolated_state()
         try:
             ensure_dirs()
-            atomic_write_json(config_path(), {"providers": {"openrouter": {"enabled": False}}})
+            save_config({"providers": {"openrouter": {"enabled": False}}})
             # openrouter is disabled; vercel-ai is enabled but has no key (no secrets.json)
             for pid in ("openrouter", "vercel-ai"):
-                atomic_write_json(cache_path(pid), {"lastAttempt": iso(utcnow())})
-                atomic_write_json(agents_dir() / f"{pid}.json", {"id": pid})
+                save_cache(pid, {"lastAttempt": iso(utcnow())})
+                write_record(pid, {"id": pid})
             rc, snap = run_sync()
             assert rc == 0, rc
             ids = [r["id"] for r in snap["providers"]]
@@ -2059,6 +2942,19 @@ def main():
     args = parser.parse_args()
     try:
         sys.exit(args.fn(args))
+    except StateError as e:
+        # sync/status already degrade to a snapshot; the rest exit cleanly, never with a traceback
+        print(f"error: unsafe state path: {e}", file=sys.stderr)
+        sys.exit(2)
+    except LockBusy:
+        print(f"error: another omacash run holds the state lock (waited {LOCK_WAIT}s); "
+              "nothing was changed — try again", file=sys.stderr)
+        sys.exit(2)
+    except OSError as e:
+        # last resort: a state operation no guarantee covers (read-only mount, ENOSPC, EMFILE).
+        # One line, exit 2 — the contract forbids a traceback on every path.
+        print(f"error: state operation failed: {_why(e)}", file=sys.stderr)
+        sys.exit(2)
     except KeyboardInterrupt:
         sys.exit(130)
 
