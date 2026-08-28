@@ -395,10 +395,15 @@ assert.match(model.subtitle(allErrored, NOW), /2 errors · 1 not configured/);
 
 // ------------------------------------------------------------------ rows
 
+// Unconfigured providers are hidden from the list once anything is
+// configured (still reachable via the Keys view); on a first run with
+// nothing configured the full list doubles as the onboarding checklist.
 const rows = model.providerRows(snap, NOW);
-assert.equal(rows.length, 5);
+assert.equal(rows.length, 4);
 assert.deepEqual(Array.from(rows, r => r.id),
-  ['openrouter', 'vercel-ai', 'elevenlabs', 'openai-api', 'anthropic-api']);
+  ['openrouter', 'vercel-ai', 'elevenlabs', 'openai-api']);
+assert.equal(model.providerRows(firstRun, NOW).length, 2);
+assert.ok(model.providerRows(firstRun, NOW).every(r => r.greyed));
 
 assert.equal(rows[0].name, 'OpenRouter');
 assert.equal(rows[0].tier, 'Prepaid');
@@ -418,11 +423,12 @@ assert.equal(rows[3].value, '~$41.22');
 assert.match(rows[3].note, /^Cached data · updated \d+m ago$/);
 assert.equal(rows[3].noteRole, 'warning');
 
-assert.equal(rows[4].greyed, true);
-assert.equal(rows[4].value, '—');
-assert.equal(rows[4].percent, -1);
-assert.equal(rows[4].note, 'Run: omarchy-balances key set anthropic-api');
-assert.equal(rows[4].noteRole, 'dim');
+const unconfRow = model.providerRow(snap.providers[4], NOW);
+assert.equal(unconfRow.greyed, true);
+assert.equal(unconfRow.value, '—');
+assert.equal(unconfRow.percent, -1);
+assert.equal(unconfRow.note, 'Run: omarchy-balances key set anthropic-api');
+assert.equal(unconfRow.noteRole, 'dim');
 
 const errorRow = model.providerRow(allErrored.providers[0], NOW);
 assert.equal(errorRow.value, '!');

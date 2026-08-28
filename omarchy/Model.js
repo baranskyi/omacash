@@ -396,8 +396,13 @@ function providerRow(p, nowMs) {
 
 function providerRows(model, nowMs) {
   if (!model) return []
+  // Unconfigured providers are hidden once anything is configured — they
+  // remain reachable through the Keys view. On a fresh install (nothing
+  // configured yet) the full list doubles as the onboarding checklist.
+  var hideUnconfigured = configuredProviders(model).length > 0
   var rows = []
   for (var i = 0; i < model.providers.length && i < MAX_PROVIDERS; i++) {
+    if (hideUnconfigured && model.providers[i].status === "unconfigured") continue
     var row = providerRow(model.providers[i], nowMs)
     if (row) rows.push(row)
   }
