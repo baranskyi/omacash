@@ -1,4 +1,4 @@
-# Balances — money left on your AI services, in the Omarchy bar
+# Omacash — money left on your AI services, in the Omarchy bar
 
 One pill in the Omarchy Quattro bar showing what is **left** — not what you spent — across
 five services, with a keyboard-navigable popup and native records in Omarchy's built-in
@@ -27,7 +27,7 @@ No other external dependencies. The plugin talks only to the five provider APIs 
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/baranskyi/omarchy-balances.git --enable
+omarchy plugin add https://github.com/baranskyi/omacash.git --enable
 ```
 
 Pick a bar section when prompted (default: right). The pill shows `$ …` until keys are configured.
@@ -50,7 +50,7 @@ updates. Keys you need:
 **Terminal alternative** (same storage, guided and live-tested):
 
 ```bash
-BAL="python3 $HOME/.config/omarchy/plugins/io.github.baranskyi.balances/bin/omarchy-balances"
+BAL="python3 $HOME/.config/omarchy/plugins/io.github.baranskyi.omacash/bin/omacash"
 $BAL setup          # guided: paste each key (hidden input), live-tested immediately
 ```
 
@@ -71,7 +71,7 @@ currency unit against the Console once), and `$BAL sync --force` fills the bar.
 
 Keys are read from stdin only — hidden input in the terminal, a `Process` stdin write from
 the panel's Keys view — stored in
-`~/.local/state/omarchy/io.github.baranskyi.balances/secrets.json` (mode 600), sent only as
+`~/.local/state/omarchy/io.github.baranskyi.omacash/secrets.json` (mode 600), sent only as
 HTTP headers to the provider's own API host, and never appear in process arguments,
 `shell.json`, agents records, or logs. The Keys view clears its input field the moment you
 press Save. The OpenAI/Anthropic admin keys and the OpenRouter
@@ -89,19 +89,19 @@ machine's disk as their security boundary.
 Settings (display only) live in `shell.json`:
 
 ```bash
-omarchy bar set io.github.baranskyi.balances pillMode attention   # total | attention | pinned
-omarchy bar set io.github.baranskyi.balances showLabel true --json
+omarchy bar set io.github.baranskyi.omacash pillMode attention   # total | attention | pinned
+omarchy bar set io.github.baranskyi.omacash showLabel true --json
 ```
 
 Behavior settings (refresh interval, thresholds, ledgers, per-provider enable) live in
-`~/.local/state/omarchy/io.github.baranskyi.balances/config.json` — see
+`~/.local/state/omarchy/io.github.baranskyi.omacash/config.json` — see
 [`config.example.json`](config.example.json).
 
 ## Remove
 
 ```bash
-python3 ~/.config/omarchy/plugins/io.github.baranskyi.balances/bin/omarchy-balances cleanup
-omarchy plugin remove io.github.baranskyi.balances
+python3 ~/.config/omarchy/plugins/io.github.baranskyi.omacash/bin/omacash cleanup
+omarchy plugin remove io.github.baranskyi.omacash
 ```
 
 `cleanup` deletes the plugin's five Agents-panel records and its state directory
@@ -111,9 +111,9 @@ omarchy plugin remove io.github.baranskyi.balances
 
 ```bash
 node omarchy/model.test.mjs                      # pure-JS model tests
-./bin/omarchy-balances selftest                  # offline CLI tests against tests/fixtures/
+./bin/omacash selftest                  # offline CLI tests against tests/fixtures/
 omarchy plugin validate .
-omarchy plugin add ~/path/to/omarchy-balances    # symlinks fail validation; add the dir itself
+omarchy plugin add ~/path/to/omacash    # symlinks fail validation; add the dir itself
 ```
 
 ## License

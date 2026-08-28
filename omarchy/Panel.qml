@@ -12,8 +12,8 @@ import "Model.js" as Model
 // a poller — a manual refresh just runs the CLI once and rereads the file.
 Panel {
   id: root
-  moduleName: "io.github.baranskyi.balances"
-  ipcTarget: "io.github.baranskyi.balances"
+  moduleName: "io.github.baranskyi.omacash"
+  ipcTarget: "io.github.baranskyi.omacash"
   manageIpc: false
 
   property var anchorItem: null
@@ -31,11 +31,11 @@ Panel {
 
   readonly property string pluginDir: Qt.resolvedUrl("..").toString()
     .replace(/^file:\/\//, "").replace(/\/$/, "")
-  readonly property string cliPath: pluginDir + "/bin/omarchy-balances"
+  readonly property string cliPath: pluginDir + "/bin/omacash"
   readonly property string snapshotPath: {
     var xdg = Quickshell.env("XDG_STATE_HOME")
     var base = xdg && String(xdg) !== "" ? String(xdg) : Quickshell.env("HOME") + "/.local/state"
-    return base + "/omarchy/io.github.baranskyi.balances/snapshot.json"
+    return base + "/omarchy/io.github.baranskyi.omacash/snapshot.json"
   }
 
   property var snapshotModel: null

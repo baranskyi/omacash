@@ -5,11 +5,11 @@ If something here conflicts with any other document, THIS file wins.
 
 ## Identifiers
 
-- Plugin id: `io.github.baranskyi.balances`
-- CLI file: `bin/omarchy-balances` (invoked as `/usr/bin/env python3 <pluginDir>/bin/omarchy-balances …`)
+- Plugin id: `io.github.baranskyi.omacash`
+- CLI file: `bin/omacash` (invoked as `/usr/bin/env python3 <pluginDir>/bin/omacash …`)
 - Provider ids (fixed, used everywhere — config, cache, snapshot, agents records):
   `openrouter`, `vercel-ai`, `elevenlabs`, `openai-api`, `anthropic-api`
-- State dir: `~/.local/state/omarchy/io.github.baranskyi.balances/`
+- State dir: `~/.local/state/omarchy/io.github.baranskyi.omacash/`
   (`secrets.json` 0600 in 0700 dir, `config.json`, `cache/<id>.json`, `snapshot.json`, `alerts.json`, `lock`)
 - Agents records dir: `~/.local/state/omarchy/agents/usage/<provider-id>.json`
 - Respect `XDG_STATE_HOME` (fallback `~/.local/state`) in BOTH the CLI and QML.
@@ -49,7 +49,7 @@ Rules:
 - Money amounts in **snapshot** are **decimal strings** ("23.40"). `percentRemaining` is a JSON number 0..1 or null. ElevenLabs `balance.currency` is `"credits"` and its amounts are integer strings ("71000").
 - `status` ∈ `ok | error | unconfigured`. `severity` ∈ `ok | low | critical | unknown`.
 - `source` ∈ `credits | key-limit | subscription | ledger`.
-- `error` is null or `{ "kind": "auth|network|http|config|unit-suspect|stale-expired", "message": "...", "hint": "..." }`. `hint` (top-level) is only for `unconfigured` rows. Hints/authHelpText spell out the full invocation, `"python3 " + abspath(CLI)` (e.g. "Run: python3 <pluginDir>/bin/omarchy-balances key set openrouter"), since bare `omarchy-balances` is not on PATH.
+- `error` is null or `{ "kind": "auth|network|http|config|unit-suspect|stale-expired", "message": "...", "hint": "..." }`. `hint` (top-level) is only for `unconfigured` rows. Hints/authHelpText spell out the full invocation, `"python3 " + abspath(CLI)` (e.g. "Run: python3 <pluginDir>/bin/omacash key set openrouter"), since bare `omacash` is not on PATH.
 - `stale:true` = showing last-good data after a failed refresh; kept ≤ 7 days, then `balance:null` + error kind `stale-expired`.
 - `estimated:true` on ledger-derived balances (openai-api, anthropic-api) and on any value the CLI computed rather than read.
 - `totalRemainingUsd`: sum of USD `remaining` over ready providers only (credits excluded); decimal string; `"0.00"` if none. `anyEstimated`: any summed entry estimated.

@@ -12,7 +12,7 @@ vm.runInContext(source, model, {filename: 'Model.js'});
 const manifest = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
 assert.strictEqual(manifest.schemaVersion, 1);
 assert.strictEqual(typeof manifest.schemaVersion, 'number');
-assert.equal(manifest.id, 'io.github.baranskyi.balances');
+assert.equal(manifest.id, 'io.github.baranskyi.omacash');
 assert.deepEqual(manifest.kinds, ['bar-widget', 'service']);
 assert.equal(manifest.entryPoints.barWidget, 'omarchy/BarWidget.qml');
 assert.equal(manifest.entryPoints.service, 'service/Service.qml');
@@ -180,7 +180,7 @@ const snapshotRaw = JSON.stringify({
     {id: 'anthropic-api', name: 'Anthropic API', status: 'unconfigured', source: null,
      balance: null, percentRemaining: null, severity: 'unknown', resetsAt: null, ledgerSince: null,
      detail: '', fetchedAt: '', stale: false, error: null,
-     hint: 'Run: omarchy-balances key set anthropic-api'}
+     hint: 'Run: omacash key set anthropic-api'}
   ]
 });
 const NOW = Date.parse('2026-08-28T15:50:00Z');
@@ -199,7 +199,7 @@ assert.equal(snap.providers[3].balance.estimated, true);
 assert.equal(snap.providers[3].stale, true);
 assert.equal(snap.providers[4].status, 'unconfigured');
 assert.equal(snap.providers[4].balance, null);
-assert.equal(snap.providers[4].hint, 'Run: omarchy-balances key set anthropic-api');
+assert.equal(snap.providers[4].hint, 'Run: omacash key set anthropic-api');
 
 // Malformed input is rejected, never partially trusted.
 assert.equal(model.parseSnapshot('{').ok, false);
@@ -293,10 +293,10 @@ const firstRun = model.parseSnapshot(JSON.stringify({
   anyEstimated: false, attention: null, providers: [
     {id: 'openrouter', name: 'OpenRouter', status: 'unconfigured', severity: 'unknown',
      stale: false, balance: null, percentRemaining: null, error: null,
-     hint: 'Run: omarchy-balances key set openrouter'},
+     hint: 'Run: omacash key set openrouter'},
     {id: 'anthropic-api', name: 'Anthropic API', status: 'unconfigured', severity: 'unknown',
      stale: false, balance: null, percentRemaining: null, error: null,
-     hint: 'Run: omarchy-balances key set anthropic-api'}
+     hint: 'Run: omacash key set anthropic-api'}
   ]})).model;
 assert.equal(model.totalText(firstRun), '$ …');
 assert.equal(model.barText(firstRun, 'total', 'openrouter', false, false), '$ …');
@@ -344,7 +344,7 @@ const allErrored = model.parseSnapshot(JSON.stringify({
     {id: 'elevenlabs', name: 'ElevenLabs', status: 'error', severity: 'unknown', stale: false,
      balance: null, percentRemaining: null, error: {kind: 'network', message: 'timeout'}},
     {id: 'anthropic-api', name: 'Anthropic API', status: 'unconfigured', severity: 'unknown',
-     stale: false, balance: null, percentRemaining: null, hint: 'Run: omarchy-balances setup'}
+     stale: false, balance: null, percentRemaining: null, hint: 'Run: omacash setup'}
   ]})).model;
 assert.equal(model.everyConfiguredErrored(allErrored), true);
 assert.equal(model.barText(allErrored, 'total', 'openrouter', false, false), '$ !');
@@ -381,12 +381,12 @@ assert.equal(model.anyUnconfigured(crowd.providers.length ? model.parseSnapshot(
 // -------------------------------------------------------- tooltip + hero
 
 const tooltip = model.tooltipText(snap, NOW);
-assert.match(tooltip, /^Balances ~\$118 /);
+assert.match(tooltip, /^Omacash ~\$118 /);
 assert.match(tooltip, /OR ~?\$23\.40/);
 assert.match(tooltip, /EL 71k cr/);
 assert.match(tooltip, /updated just now/);
 assert.doesNotMatch(tooltip, /AN/); // unconfigured rows stay out of the tooltip
-assert.equal(model.tooltipText(null, NOW), 'Balances · waiting for first sync');
+assert.equal(model.tooltipText(null, NOW), 'Omacash · waiting for first sync');
 
 assert.equal(model.subtitle(snap, NOW),
   '1 estimated · 1 stale · 1 not configured · updated just now');
@@ -427,7 +427,7 @@ const unconfRow = model.providerRow(snap.providers[4], NOW);
 assert.equal(unconfRow.greyed, true);
 assert.equal(unconfRow.value, '—');
 assert.equal(unconfRow.percent, -1);
-assert.equal(unconfRow.note, 'Run: omarchy-balances key set anthropic-api');
+assert.equal(unconfRow.note, 'Run: omacash key set anthropic-api');
 assert.equal(unconfRow.noteRole, 'dim');
 
 const errorRow = model.providerRow(allErrored.providers[0], NOW);
@@ -460,17 +460,17 @@ assert.equal(model.booleanSetting('0', true), false);
 assert.equal(model.booleanSetting(undefined, true), true);
 
 const prior = {pillMode: 'pinned', future: {keep: true}, id: 'stale-id'};
-const next = model.settingsWithOverrides(prior, 'io.github.baranskyi.balances', {pinnedProvider: 'elevenlabs'});
+const next = model.settingsWithOverrides(prior, 'io.github.baranskyi.omacash', {pinnedProvider: 'elevenlabs'});
 assert.deepEqual(JSON.parse(JSON.stringify(next)), {
-  id: 'io.github.baranskyi.balances',
+  id: 'io.github.baranskyi.omacash',
   pillMode: 'pinned',
   future: {keep: true},
   pinnedProvider: 'elevenlabs'
 });
 assert.equal(prior.pinnedProvider, undefined);
-const guarded = model.settingsWithOverrides({}, 'io.github.baranskyi.balances',
+const guarded = model.settingsWithOverrides({}, 'io.github.baranskyi.omacash',
   {id: 'wrong', constructor: 'x', prototype: 'x', showLabel: true});
-assert.equal(guarded.id, 'io.github.baranskyi.balances');
+assert.equal(guarded.id, 'io.github.baranskyi.omacash');
 assert.notEqual(guarded.constructor, 'x');
 assert.equal(guarded.prototype, undefined);
 assert.equal(guarded.showLabel, true);
@@ -514,4 +514,4 @@ assert.equal(model.keyCommandErrorMessage(1, 'line1\nline2\n<script>' + String.f
 // Capped: a huge traceback cannot flood the row.
 assert.ok(model.keyCommandErrorMessage(1, 'x'.repeat(5000)).length <= 301);
 
-console.log('Balances model tests passed');
+console.log('Omacash model tests passed');

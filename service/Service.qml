@@ -2,7 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Background publisher for io.github.baranskyi.balances. Runs the bundled CLI's
+// Background publisher for io.github.baranskyi.omacash. Runs the bundled CLI's
 // `sync` on a fixed 5-minute tick; the CLI's own per-provider TTL gate (read
 // from its config.json) decides what actually refreshes, so the real cadence
 // is config-driven without this service parsing that config. The CLI writes
@@ -16,14 +16,14 @@ Item {
   // This file lives in service/, so the plugin root is one level up.
   readonly property string pluginDir: Qt.resolvedUrl("..").toString()
     .replace(/^file:\/\//, "").replace(/\/$/, "")
-  readonly property string cliPath: pluginDir + "/bin/omarchy-balances"
+  readonly property string cliPath: pluginDir + "/bin/omacash"
 
   readonly property string stateBase: {
     var xdg = Quickshell.env("XDG_STATE_HOME")
     var base = xdg && String(xdg) !== "" ? String(xdg) : Quickshell.env("HOME") + "/.local/state"
     return base + "/omarchy"
   }
-  readonly property string stateDir: stateBase + "/io.github.baranskyi.balances"
+  readonly property string stateDir: stateBase + "/io.github.baranskyi.omacash"
   readonly property string usageDir: stateBase + "/agents/usage"
 
   readonly property int baseIntervalMs: 300000

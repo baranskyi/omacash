@@ -7,7 +7,7 @@ import qs.Ui
 // owns snapshot parsing and presentation.
 BarWidget {
   id: root
-  moduleName: "io.github.baranskyi.balances"
+  moduleName: "io.github.baranskyi.omacash"
 
   readonly property var panelItem: panelLoader.item
   readonly property bool opened: panelItem ? panelItem.opened === true : false
@@ -73,7 +73,7 @@ BarWidget {
     fontSize: Style.font.bodySmall
     active: root.panelItem ? root.panelItem.alarming : false
     dimmed: root.panelItem ? root.panelItem.dimmedAll : false
-    tooltipText: root.panelItem ? root.panelItem.tooltipText() : "Balances"
+    tooltipText: root.panelItem ? root.panelItem.tooltipText() : "Omacash"
     horizontalMargin: 8.5
 
     onPressed: function(buttonCode) {

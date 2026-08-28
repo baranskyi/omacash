@@ -1,4 +1,4 @@
-// Pure data shaping for the Balances widget. No QML globals: the exact
+// Pure data shaping for the Omacash widget. No QML globals: the exact
 // snapshot contract (CONTRACT.md) is exercised by Node in model.test.mjs.
 // Money stays a decimal string end to end; the only "math" here is display
 // formatting of pre-rendered strings and the percent numbers the CLI computed.
@@ -304,8 +304,8 @@ function anyUnconfigured(model) {
 }
 
 function tooltipText(model, nowMs) {
-  if (!model) return "Balances · waiting for first sync"
-  var parts = ["Balances " + totalText(model)]
+  if (!model) return "Omacash · waiting for first sync"
+  var parts = ["Omacash " + totalText(model)]
   var configured = configuredProviders(model)
   for (var i = 0; i < configured.length; i++)
     parts.push(providerPillText(configured[i], true))

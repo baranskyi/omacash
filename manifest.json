@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.baranskyi.balances",
-  "name": "Balances",
+  "id": "io.github.baranskyi.omacash",
+  "name": "Omacash",
   "version": "0.1.0",
   "author": "Slava Baranskyi",
   "license": "MIT",
@@ -15,7 +15,7 @@
     "service": "service/Service.qml"
   },
   "barWidget": {
-    "displayName": "Balances",
+    "displayName": "Omacash",
     "description": "Prepaid balances, credits, and ledger-estimated remainders for five AI providers, with severity meters and reset countdowns.",
     "category": "AI",
     "allowMultiple": false,
@@ -30,7 +30,7 @@
         "key": "pillMode",
         "type": "enum",
         "label": "Pill mode",
-        "description": "What the bar pill shows: the USD total across providers, the provider that most needs attention, or one pinned provider. No settings GUI exists in this build; set it with: omarchy bar set io.github.baranskyi.balances pillMode <value>",
+        "description": "What the bar pill shows: the USD total across providers, the provider that most needs attention, or one pinned provider. No settings GUI exists in this build; set it with: omarchy bar set io.github.baranskyi.omacash pillMode <value>",
         "options": ["total", "attention", "pinned"],
         "defaultValue": "total"
       },
