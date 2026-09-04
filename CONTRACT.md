@@ -7,12 +7,14 @@ If something here conflicts with any other document, THIS file wins.
 
 - Plugin id: `io.github.baranskyi.omacash`
 - CLI file: `bin/omacash` (invoked as `/usr/bin/env python3 <pluginDir>/bin/omacash …`)
-- Provider ids (fixed, used everywhere — config, cache, snapshot, agents records):
+- Provider ids (fixed, used everywhere — config, cache, snapshot):
   `openrouter`, `vercel-ai`, `elevenlabs`, `openai-api`, `anthropic-api`
 - State dir: `~/.local/state/omarchy/io.github.baranskyi.omacash/`
   (`config.json`, `secrets.json`, `cache/<id>.json`, `snapshot.json`, `alerts.json`, `lock` — every
   one of them 0600, in a 0700 dir; see "State directory safety")
-- Agents records dir: `~/.local/state/omarchy/agents/usage/<provider-id>.json`
+- Omarchy's agents-usage dir, `~/.local/state/omarchy/agents/usage/`: this plugin never writes
+  there; it only unlinks `<provider-id>.json` records that versions up to 0.1.0 left behind
+  (see "Leftover agents records")
 - Respect `XDG_STATE_HOME` (fallback `~/.local/state`) in the CLI. The QML side MUST NOT derive,
   name, or open any state path: it holds no state directory constant, calls no `Quickshell.env`,
   uses no `FileView`, and creates no directory. The CLI is the only reader and writer of the
@@ -111,31 +113,17 @@ Rules:
   pre-first-sync placeholder printed by `status`; it is never published (the UI keeps waiting)
   because it would otherwise read as "every provider disabled".
 
-## Agents panel records  (written atomically by CLI `sync` to agents/usage/<id>.json)
+## Leftover agents records  (unlinked by CLI `sync` and `cleanup`)
 
-Money in **agents records** is **JSON numbers** (the panel computes `remaining / funded`).
-Only written for configured providers; `sync` unlinks the record (and cache file) of disabled and
-unconfigured providers. On fetch error:
+Versions up to 0.1.0 mirrored every balance into Omarchy's built-in **Agents** panel as
+`agents/usage/<provider-id>.json`. That panel is for the coding agents running on the machine,
+so this plugin no longer writes there and shows balances in its own panel only.
 
-- error kind NOT `auth`/`config`, and a last-good fetch ≤ 7 days old exists → keep writing the
-  cached last-good record **unchanged** (`updatedAt` stays at the data's fetch time);
-- error kind `auth` or `config`, OR last-good older than 7 days (`stale-expired`), OR no last-good →
-  write `ready:false` + `authHelpText` (the error hint), with no balance/limits fields.
-
-Common fields: `schemaVersion:1`, `id` == filename stem (assert before write), `name`,
-`updatedAt` (ISO8601), `ready` (bool), `scope:"account"`, `tierLabel`, `usageStatusText`,
-`authHelpText` (only when not ready), plus zeroed count fields the panel tolerates missing —
-include `limits: []` when unused.
-
-| id | balance{} (numbers) | limits[] | tierLabel | usageStatusText example |
-|---|---|---|---|---|
-| openrouter | remaining/funded/spent, currency:"USD", estimated:false | [] | "Prepaid" (or "Key limit" on fallback) | "$23.40 remaining · $96.60 used" |
-| vercel-ai | same | [] | "AI Gateway" | "$95.50 remaining" |
-| elevenlabs | — omit balance (not money) | [{label:"Credits", percent: used/limit (0..1), resetsAt: ISO8601, title:"Credits"}] | subscription tier | "71,000 of 100,000 credits" |
-| openai-api | remaining/funded/spent, "USD", **estimated:true** | [] | "Prepaid (est.)" | "≈ $41.22 remaining since Aug 1" |
-| anthropic-api | same | [] | "Prepaid (est.)" | "≈ $…" |
-
-Panel facts (verified in /usr/share/omarchy/shell/plugins/agents/): tab shows if balance set OR limits nonempty; alarm when remaining/funded ≤ 0.1; "$" prefix for USD; `estimated` appends "· estimated" to the detail line.
+`sync` and `cleanup` unlink `<provider-id>.json` for the five provider ids and nothing else —
+records written by Omarchy's own collectors (`claude.json`, `codex.json`, …) are never touched.
+The sweep is janitorial: when `agents/usage` is absent, is a symlink, or is writable by group or
+other, it is left alone rather than failing the command. The directory itself is never created
+and never removed.
 
 ## State directory safety (CLI; enforced on every read, write and delete)
 
@@ -148,15 +136,16 @@ open file descriptor it validated itself.
   the only open in the walk without `O_NOFOLLOW` — a symlinked `$HOME` is the user's own
   configuration — but what it resolves to still has to pass those checks. Created (0700) if absent.
 - **Component-by-component walk.** Every component below the root (`.local`, `state`, `omarchy`,
-  `<plugin-id>`, `cache`, `agents`, `usage`) is opened relative to its parent's fd with
+  `<plugin-id>`, `cache`, and — for the record sweep only — `agents`, `usage`) is opened
+  relative to its parent's fd with
   `O_RDONLY|O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC`, created with `os.mkdir(name, 0o700, dir_fd=…)` when
   missing, and validated by `fstat` **on the opened fd**: `S_ISDIR`, `st_uid == geteuid()`,
   `st_mode & 0o022 == 0`. Our own dirs (`<plugin-id>`, `cache`) are additionally pinned to 0700 via
   `fchmod` if the mode drifted. The walk returns the open dirfd; every subsequent read, write,
   rename and unlink is dirfd-relative, so a path swapped after the check cannot be raced in.
-- **Agents records dir** (`omarchy/agents/usage`) is shared with Omarchy's own collectors: same
-  owner and not writable by group/other are required, but its mode is left exactly as Omarchy set
-  it (0755 is fine) — never forced to 0700.
+- **Agents usage dir** (`omarchy/agents/usage`) belongs to Omarchy: the sweep requires the same
+  owner and no group/other write, but its mode is left exactly as Omarchy set it (0755 is fine) —
+  never forced to 0700, and never created by this plugin.
 - **Bounded no-follow reads.** `read_bounded(dirfd, name, limit)` opens with
   `O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` (the `O_NONBLOCK` keeps a planted FIFO from parking the
   CLI on `open`), then requires `S_ISREG`, `st_uid == geteuid()` and `st_size <= limit`, reads at
@@ -173,8 +162,8 @@ open file descriptor it validated itself.
   a write target is replaced, never written through.
 - **Deletes** (`sync` clearing disabled/unconfigured providers, `key clear`, `cleanup`) use
   `os.unlink(name, dir_fd=…)` and a dirfd-recursive rmtree, so they remove the link, never the
-  target it points at. `cleanup` removes the plugin state dir and our own agents records; the
-  shared `agents/usage` directory itself is left in place. A delete the kernel refuses (an
+  target it points at. `cleanup` removes the plugin state dir and any leftover agents record of
+  ours; the shared `agents/usage` directory itself is left in place. A delete the kernel refuses (an
   unwritable parent directory, a non-empty directory) is a `StateError` naming that entry — never
   a partial silent success.
 - **Concurrency.** `<plugin-id>/lock` (`flock`, 0600, 15 s wait) serializes every read-modify-write

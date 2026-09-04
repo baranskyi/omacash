@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.baranskyi.omacash",
   "name": "Omacash",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Slava Baranskyi",
   "license": "MIT",
-  "description": "Remaining money and credits across OpenRouter, Vercel AI Gateway, ElevenLabs, OpenAI, and Anthropic in one bar pill, popup, and Agents-panel records.",
+  "description": "Remaining money and credits across OpenRouter, Vercel AI Gateway, ElevenLabs, OpenAI, and Anthropic in one bar pill and popup.",
   "kinds": [
     "bar-widget",
     "service"

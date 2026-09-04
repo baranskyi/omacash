@@ -1,8 +1,7 @@
 # Omacash — money left on your AI services, in the Omarchy bar
 
 One pill in the Omarchy Quattro bar showing what is **left** — not what you spent — across
-five services, with a keyboard-navigable popup and native records in Omarchy's built-in
-Agents panel (so balances ride its cross-machine sync).
+five services, with a keyboard-navigable popup.
 
 | Service | What you see | How |
 |---|---|---|
@@ -73,7 +72,7 @@ Keys are read from stdin only — hidden input in the terminal, a `Process` stdi
 the panel's Keys view — stored in
 `~/.local/state/omarchy/io.github.baranskyi.omacash/secrets.json` (mode 600), sent only as
 HTTP headers to the provider's own API host, and never appear in process arguments,
-`shell.json`, agents records, or logs. The Keys view clears its input field the moment you
+`shell.json` or logs. The Keys view clears its input field the moment you
 press Save. The OpenAI/Anthropic admin keys and the OpenRouter
 management key are powerful credentials — this plugin only reads with them, but treat the
 machine's disk as their security boundary.
@@ -86,8 +85,6 @@ only component that reads its own config, keys, cache, and snapshot.
 
 - **Left-click** the pill — popup with all balances (j/k scroll, r refresh, Esc close). The **Keys** footer button opens in-panel key entry; Esc there first returns to the balances list.
 - **Right-click** — refresh now. **Wheel** — cycle the pinned provider (in `pinned` mode).
-- The same balances appear as tabs in Omarchy's built-in **Agents** panel; enable its
-  `syncMode` to carry them to your other machines.
 - Low/critical balances recolor the pill and send one desktop notification (no repeats).
 
 Settings (display only) live in `shell.json`:
@@ -108,8 +105,8 @@ python3 ~/.config/omarchy/plugins/io.github.baranskyi.omacash/bin/omacash cleanu
 omarchy plugin remove io.github.baranskyi.omacash
 ```
 
-`cleanup` deletes the plugin's five Agents-panel records and its state directory
-(including stored keys). Run it first — the Agents panel keeps records forever otherwise.
+`cleanup` deletes the plugin's state directory (including stored keys), plus any record an
+older version left in Omarchy's Agents panel. Run it before removing the plugin.
 
 ## Development
 

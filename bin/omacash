@@ -268,8 +268,9 @@ def cache_handle():
 
 @contextlib.contextmanager
 def agents_handle():
-    # Shared with Omarchy's own collectors: same owner and not group/world-writable, but the
-    # mode is Omarchy's business — never forced to 0700.
+    # Omarchy's own directory, opened only to delete records that older versions of this
+    # plugin wrote there: same owner and not group/world-writable, but the mode is
+    # Omarchy's business — never forced to 0700.
     h = verified_dir([("agents", False), ("usage", False)])
     try:
         yield h
@@ -279,8 +280,6 @@ def agents_handle():
 
 def ensure_dirs():
     with cache_handle():
-        pass
-    with agents_handle():
         pass
 
 
@@ -1005,7 +1004,7 @@ def fetch_provider(pid, key, pcfg, http, cache, today):
     return fetch_ledger_provider(pid, key, pcfg, http, cache, today)
 
 
-# ---------- rendering: snapshot rows and agents records ----------
+# ---------- rendering: snapshot rows ----------
 
 def severity_of(remaining, percent, currency, th):
     if remaining is None:
@@ -1088,44 +1087,6 @@ def build_row(pid, norm, fetched_iso, th):
     }
 
 
-def _zero_counts():
-    return {"todayPrompts": 0, "todaySessions": 0, "totalPrompts": 0, "totalSessions": 0, "activeDays": 0}
-
-
-def build_record(pid, norm, fetched_iso):
-    rec = {
-        "schemaVersion": 1,
-        "id": pid,
-        "name": NAMES[pid],
-        "updatedAt": fetched_iso,
-        "ready": True,
-        "scope": "account",
-        "tierLabel": sanitize(norm["tierLabel"]),
-        "usageStatusText": sanitize(usage_text_for(pid, norm)),
-        "limits": [],
-        **_zero_counts(),
-    }
-    if pid == "elevenlabs":
-        funded = norm["funded"]
-        used_pct = round(float(norm["spent"] / funded), 4) if funded and funded > 0 else 0.0
-        rec["limits"] = [{
-            "label": "Credits",
-            "title": "Credits",
-            "percent": min(max(used_pct, 0.0), 1.0),
-            "resetsAt": norm.get("resetsAt"),
-        }]
-    else:
-        # agents records carry money as JSON numbers (the panel divides remaining/funded)
-        rec["balance"] = {
-            "remaining": float(q2(norm["remaining"])),
-            "funded": float(q2(norm["funded"])) if norm["funded"] is not None else None,
-            "spent": float(q2(norm["spent"])),
-            "currency": "USD",
-            "estimated": bool(norm["estimated"]),
-        }
-    return rec
-
-
 def error_row(pid, err, attempt_iso):
     return {
         "id": pid,
@@ -1146,22 +1107,6 @@ def error_row(pid, err, attempt_iso):
             "hint": sanitize(err.get("hint")),
         },
         "hint": None,
-    }
-
-
-def error_record(pid, err, now_iso):
-    return {
-        "schemaVersion": 1,
-        "id": pid,
-        "name": NAMES[pid],
-        "updatedAt": now_iso,
-        "ready": False,
-        "scope": "account",
-        "tierLabel": None,
-        "usageStatusText": sanitize(err.get("message")) or "unavailable",
-        "authHelpText": sanitize(err.get("hint")) or f"Run: {INVOKE} doctor",
-        "limits": [],
-        **_zero_counts(),
     }
 
 
@@ -1242,37 +1187,38 @@ def row_from_cache(pid, cache, now):
     attempt = cache.get("lastAttempt")
     if isinstance(lg, dict) and lg.get("row"):
         row = json.loads(json.dumps(lg["row"]))
-        rec = json.loads(json.dumps(lg["record"])) if lg.get("record") else None
         if le:
             fetched = parse_iso(lg.get("fetchedAt"))
             if fetched and (now - fetched) <= STALE_MAX:
                 row["stale"] = True
                 row["error"] = le
-                # auth/config failures need the user to act: record flips to ready:false
-                # even while last-good data is still fresh; other kinds keep the cached
-                # record unchanged (updatedAt stays at the data's fetch time)
-                if (le.get("kind") or "") in ("auth", "config"):
-                    rec = error_record(pid, le, iso(now))
-                return row, rec
+                return row
             expired = {"kind": "stale-expired",
                        "message": "no successful fetch in over 7 days",
                        "hint": (le or {}).get("hint")}
-            return error_row(pid, expired, attempt), error_record(pid, expired, iso(now))
-        return row, rec
+            return error_row(pid, expired, attempt)
+        return row
     if le:
-        return error_row(pid, le, attempt), error_record(pid, le, iso(now))
+        return error_row(pid, le, attempt)
     never = {"kind": "network", "message": "no data yet", "hint": None}
-    return error_row(pid, never, attempt), error_record(pid, never, iso(now))
+    return error_row(pid, never, attempt)
 
 
-def write_record(pid, rec):
-    if rec.get("id") != pid:
-        raise AssertionError(f"record id {rec.get('id')!r} != filename stem {pid!r}")
-    name = f"{pid}.json"
-    if Path(name).stem != rec["id"]:
-        raise AssertionError("record id does not match filename stem")
-    with agents_handle() as h:
-        write_json_at(h, name, rec)
+def drop_agents_records(pids):
+    """Sweep records an older version of this plugin wrote into Omarchy's agents panel.
+
+    That panel belongs to the coding agents running on the machine; balances live in this
+    plugin's own panel. The sweep is janitorial, so an agents directory this plugin will not
+    write to (symlinked, or writable by anyone else) is left alone rather than failing sync.
+    """
+    if not agents_dir().is_dir():
+        return
+    try:
+        with agents_handle() as h:
+            for pid in pids:
+                unlink_at(h, f"{pid}.json")
+    except StateError:
+        pass
 
 
 def notify(pid, severity):
@@ -1404,8 +1350,6 @@ def exit_code_for(rows):
 def clear_provider_state(pid):
     with cache_handle() as h:
         unlink_at(h, f"{pid}.json")
-    with agents_handle() as h:
-        unlink_at(h, f"{pid}.json")
 
 
 STATE_ERROR_HINT = "Remove that path or restore it to a directory/file you own with mode 0700/0600"
@@ -1469,7 +1413,6 @@ def _cmd_sync(args):
 
     try:
         rows = []
-        records = {}
         today = now.date()
         for pid in PROVIDERS:
             pcfg = cfg["providers"][pid]
@@ -1492,28 +1435,24 @@ def _cmd_sync(args):
                     norm = fetch_provider(pid, key, pcfg, http_get, cache, today)
                     fetched = iso(utcnow())
                     row = build_row(pid, norm, fetched, th)
-                    rec = build_record(pid, norm, fetched)
                     cache.update({
                         "lastAttempt": iso(now), "failCount": 0, "lastError": None,
-                        "lastGood": {"fetchedAt": fetched, "row": row, "record": rec},
+                        "lastGood": {"fetchedAt": fetched, "row": row},
                     })
                 except FetchError as e:
                     cache["lastAttempt"] = iso(now)
                     cache["failCount"] = int(cache.get("failCount") or 0) + 1
                     cache["lastError"] = {"kind": e.kind, "message": sanitize(e.message),
                                           "hint": sanitize(e.hint)}
-                    row, rec = row_from_cache(pid, cache, now)
+                    row = row_from_cache(pid, cache, now)
                 save_cache(pid, cache)
             else:
-                row, rec = row_from_cache(pid, cache, now)
+                row = row_from_cache(pid, cache, now)
             rows.append(row)
-            if rec is not None:
-                records[pid] = rec
 
         snap = build_snapshot(rows, now)
         write_state_file("snapshot.json", snap)
-        for pid, rec in records.items():
-            write_record(pid, rec)
+        drop_agents_records(PROVIDERS)
         process_alerts(rows)
         print(json.dumps(snap, indent=2))
         return exit_code_for(rows)
@@ -1839,10 +1778,11 @@ def cmd_setup(args):
 
 def cmd_cleanup(args):
     removed = []
-    with agents_handle() as h:
-        for pid in PROVIDERS:
-            if unlink_at(h, f"{pid}.json"):
-                removed.append(os.path.join(h.path, f"{pid}.json"))
+    if agents_dir().is_dir():
+        with agents_handle() as h:
+            for pid in PROVIDERS:
+                if unlink_at(h, f"{pid}.json"):
+                    removed.append(os.path.join(h.path, f"{pid}.json"))
     # walk to the verified shared parent, then delete our own tree dirfd-relative
     with verified_dir([]) as parent:
         display = os.path.join(parent.path, PLUGIN_ID)
@@ -2176,43 +2116,6 @@ def run_selftest():
         assert snap3["attention"] is None
     t("attention: worst severity, ties by lowest percent", t_attention)
 
-    # -- agents record shape (numbers!)
-    def t_record_shape():
-        h1 = http_of([("https://openrouter.ai/api/v1/credits", (200, fx("openrouter-credits.json")))])
-        rec = build_record("openrouter", fetch_openrouter("k", {}, h1), "2026-08-28T15:49:58Z")
-        assert rec["schemaVersion"] == 1 and rec["id"] == "openrouter" and rec["scope"] == "account"
-        assert rec["ready"] is True
-        b = rec["balance"]
-        assert type(b["remaining"]) is float and b["remaining"] == 23.4
-        assert type(b["funded"]) is float and b["funded"] == 120.0
-        assert type(b["spent"]) is float and b["spent"] == 96.6
-        assert b["currency"] == "USD" and b["estimated"] is False
-        assert rec["limits"] == []
-        assert rec["tierLabel"] == "Prepaid"
-        assert rec["usageStatusText"] == "$23.40 remaining · $96.60 used"
-        assert rec["totalPrompts"] == 0 and rec["todayPrompts"] == 0
-        h2 = http_of([("/v1/user/subscription", (200, fx("elevenlabs-subscription.json")))])
-        rec2 = build_record("elevenlabs", fetch_elevenlabs("k", {}, h2), "2026-08-28T15:49:58Z")
-        assert "balance" not in rec2
-        lim = rec2["limits"][0]
-        assert lim["label"] == "Credits" and lim["title"] == "Credits"
-        assert type(lim["percent"]) is float and lim["percent"] == 0.29
-        assert lim["resetsAt"] == "2026-09-10T00:00:00Z"
-        assert rec2["usageStatusText"] == "71,000 of 100,000 credits"
-        assert rec2["tierLabel"] == "creator"
-        pcfg = {"enabled": True, "ledger": {"entries": [{"date": "2026-08-01", "amount": "60.00"}]}}
-        h3 = hist_aware_http(0, 18.78)
-        rec3 = build_record("openai-api", fetch_ledger_provider("openai-api", "k", pcfg, h3, {}, date(2026, 8, 15)),
-                            "2026-08-28T15:49:58Z")
-        assert rec3["balance"]["estimated"] is True
-        assert rec3["tierLabel"] == "Prepaid (est.)"
-        assert rec3["usageStatusText"] == "≈ $41.22 remaining since Aug 1"
-        errrec = error_record("vercel-ai", {"kind": "auth", "message": "HTTP 401: nope", "hint": None},
-                              "2026-08-28T15:49:58Z")
-        assert errrec["ready"] is False and "balance" not in errrec
-        assert errrec["authHelpText"]
-    t("agents records: numbers, limits, estimated, error shape", t_record_shape)
-
     # -- stale handling
     def t_stale():
         now = utcnow()
@@ -2222,44 +2125,19 @@ def run_selftest():
                     "percentRemaining": 0.195, "severity": "low", "resetsAt": None, "ledgerSince": None,
                     "detail": "d", "fetchedAt": iso(now - timedelta(days=1)), "stale": False,
                     "error": None, "hint": None}
-        good_rec = {"id": "openrouter", "ready": True, "updatedAt": iso(now - timedelta(days=1)),
-                    "balance": {"remaining": 23.4}}
         cache = {"lastAttempt": iso(now), "failCount": 1,
                  "lastError": {"kind": "network", "message": "boom", "hint": None},
-                 "lastGood": {"fetchedAt": iso(now - timedelta(days=1)), "row": good_row, "record": good_rec}}
-        row, rec = row_from_cache("openrouter", cache, now)
+                 "lastGood": {"fetchedAt": iso(now - timedelta(days=1)), "row": good_row}}
+        row = row_from_cache("openrouter", cache, now)
         assert row["stale"] is True and row["status"] == "ok"
         assert row["error"]["kind"] == "network"
-        assert rec == good_rec  # non-auth/config error: cached record unchanged, updatedAt = data time
         cache["lastGood"]["fetchedAt"] = iso(now - timedelta(days=8))
-        row2, rec2 = row_from_cache("openrouter", cache, now)
+        row2 = row_from_cache("openrouter", cache, now)
         assert row2["status"] == "error" and row2["error"]["kind"] == "stale-expired"
         assert row2["balance"] is None
-        assert rec2["ready"] is False
-    t("stale <=7d keeps last-good row+record, then stale-expired", t_stale)
-
-    def t_auth_error_record():
-        now = utcnow()
-        good_row = {"id": "openrouter", "status": "ok", "balance": {"remaining": "23.40"},
-                    "stale": False, "error": None}
-        good_rec = {"id": "openrouter", "ready": True, "updatedAt": iso(now - timedelta(days=1))}
-        cache = {"lastAttempt": iso(now), "failCount": 1,
-                 "lastError": {"kind": "auth", "message": "HTTP 401: nope", "hint": "fix the key"},
-                 "lastGood": {"fetchedAt": iso(now - timedelta(days=1)), "row": good_row, "record": good_rec}}
-        # auth error with fresh last-good: row stays stale/ok, record flips to ready:false
-        row, rec = row_from_cache("openrouter", cache, now)
-        assert row["stale"] is True and row["status"] == "ok"
-        assert rec["ready"] is False and "balance" not in rec and rec["limits"] == []
-        assert rec["authHelpText"] == "fix the key"
-        assert rec["updatedAt"] == iso(now)
-        # config kind behaves the same
-        cache["lastError"] = {"kind": "config", "message": "bad ledger", "hint": None}
-        _, rec2 = row_from_cache("openrouter", cache, now)
-        assert rec2["ready"] is False and "balance" not in rec2
-        # no last-good at all -> ready:false record
-        _, rec3 = row_from_cache("openrouter", {"lastError": {"kind": "network", "message": "boom"}}, now)
-        assert rec3["ready"] is False
-    t("auth/config error flips record to ready:false despite fresh cache", t_auth_error_record)
+        row3 = row_from_cache("openrouter", {"lastError": {"kind": "auth", "message": "boom"}}, now)
+        assert row3["status"] == "error" and row3["error"]["kind"] == "auth"
+    t("stale <=7d keeps the last-good row, then stale-expired", t_stale)
 
     # -- backoff schedule
     def t_backoff():
@@ -2540,34 +2418,41 @@ def run_selftest():
             restore()
     t("group/world-writable state dir rejected", t_writable_dir_rejected)
 
-    # -- agents records dir is shared with Omarchy: same owner, but its mode is not ours to force
-    def t_agents_dir_policy():
+    # -- records an older version left in Omarchy's agents dir are swept, never written to
+    def t_agents_records_swept():
         td, restore = isolated_state()
         try:
             ensure_dirs()
             ad = agents_dir()
-            os.chmod(ad, 0o755)
-            write_record("openrouter", {"id": "openrouter"})
-            assert mode_of(ad) == 0o755, oct(mode_of(ad))       # left exactly as Omarchy had it
-            assert mode_of(ad / "openrouter.json") == 0o600
-            os.chmod(ad, 0o775)
-            expect_state_error(lambda: write_record("openrouter", {"id": "openrouter"}),
-                               "writable", "group-writable agents dir")
-            os.chmod(ad, 0o755)
+            assert not ad.exists()                      # not this plugin's dir to create
+            ad.mkdir(parents=True, mode=0o755)
+            for pid in ("openrouter", "elevenlabs"):
+                (ad / f"{pid}.json").write_text('{"id": "%s"}\n' % pid)
+            stranger = ad / "claude.json"
+            stranger.write_text('{"id": "claude"}\n')
+            drop_agents_records(PROVIDERS)
+            assert mode_of(ad) == 0o755, oct(mode_of(ad))   # left exactly as Omarchy had it
+            for pid in ("openrouter", "elevenlabs"):
+                assert not (ad / f"{pid}.json").exists(), pid
+            assert stranger.exists()                    # Omarchy's own collectors are untouched
+            # a dir this plugin would not write to is left alone rather than failing the sweep
             shutil.rmtree(ad)
             elsewhere = td / "agents-elsewhere"
             elsewhere.mkdir(mode=0o700)
+            (elsewhere / "openrouter.json").write_text("keep me")
             os.symlink(elsewhere, ad)
-            expect_state_error(lambda: write_record("openrouter", {"id": "openrouter"}),
-                               "symlink", "symlinked usage dir")
-            assert not (elsewhere / "openrouter.json").exists()
+            drop_agents_records(PROVIDERS)
+            assert (elsewhere / "openrouter.json").read_text() == "keep me"
             os.unlink(ad)
-            ensure_dirs()
-            write_record("openrouter", {"id": "openrouter"})
+            ad.mkdir(parents=True)
+            os.chmod(ad, 0o775)                         # group-writable: not ours to touch
+            (ad / "openrouter.json").write_text("{}")
+            drop_agents_records(PROVIDERS)
             assert (ad / "openrouter.json").exists()
+            os.chmod(ad, 0o755)
         finally:
             restore()
-    t("agents usage dir: same-owner + not writable by others, mode untouched", t_agents_dir_policy)
+    t("leftover agents records swept; an unsafe agents dir left alone", t_agents_records_swept)
 
     # -- atomic write cleans its temp up on failure
     def t_atomic_write_cleanup():
@@ -2605,14 +2490,18 @@ def run_selftest():
             ensure_dirs()
             save_secrets({"openrouter": "k"})
             save_cache("openrouter", {"failCount": 0})
-            write_record("openrouter", {"id": "openrouter"})
+            agents_dir().mkdir(parents=True, mode=0o755)
+            (agents_dir() / "openrouter.json").write_text('{"id": "openrouter"}\n')
             outside = td / "precious.json"
             outside.write_text("keep me")
             os.symlink(outside, cache_dir() / "vercel-ai.json")
             os.symlink(outside, agents_dir() / "vercel-ai.json")
-            clear_provider_state("vercel-ai")           # unlinks the links, not the targets
+            clear_provider_state("vercel-ai")           # unlinks the link, not the target
             assert outside.read_text() == "keep me"
             assert not (cache_dir() / "vercel-ai.json").exists()
+            drop_agents_records(["vercel-ai"])          # same for the leftover-record sweep
+            assert outside.read_text() == "keep me"
+            assert not (agents_dir() / "vercel-ai.json").exists()
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = cmd_cleanup(None)
@@ -2814,10 +2703,11 @@ def run_selftest():
         try:
             ensure_dirs()
             save_config({"providers": {"openrouter": {"enabled": False}}})
+            agents_dir().mkdir(parents=True, mode=0o755)
             # openrouter is disabled; vercel-ai is enabled but has no key (no secrets.json)
             for pid in ("openrouter", "vercel-ai"):
                 save_cache(pid, {"lastAttempt": iso(utcnow())})
-                write_record(pid, {"id": pid})
+                (agents_dir() / f"{pid}.json").write_text('{"id": "%s"}\n' % pid)
             rc, snap = run_sync()
             assert rc == 0, rc
             ids = [r["id"] for r in snap["providers"]]
@@ -2829,7 +2719,8 @@ def run_selftest():
             assert snap["providers"][0]["hint"] == f"Run: {INVOKE} key set vercel-ai"
         finally:
             restore()
-    t("sync unlinks record+cache for disabled and unconfigured", t_cleanup_disabled_unconfigured)
+    t("sync unlinks the cache for disabled and unconfigured, and sweeps records",
+      t_cleanup_disabled_unconfigured)
 
     # -- 200 responses that are not JSON objects
     def t_nondict_json():
@@ -2883,10 +2774,6 @@ def run_selftest():
         row = unconfigured_row("openrouter")
         assert row["hint"] == f"Run: {INVOKE} key set openrouter"
         assert len(row["hint"]) <= 200  # stays inside the sanitizer cap
-        rec = error_record("openrouter", {"kind": "auth", "message": "m", "hint": None},
-                           "2026-08-28T15:49:58Z")
-        assert rec["authHelpText"] == f"Run: {INVOKE} doctor"
-        assert len(rec["authHelpText"]) <= 200
         # a FetchError hint survives the sanitize applied when caching errors
         assert INVOKE in sanitize(f"Run: {INVOKE} ledger set openai-api --funded <usd> --since <YYYY-MM-DD>")
     t("user-facing hints use the python3+path invocation", t_invoke_hints)
@@ -2904,7 +2791,7 @@ def main():
     parser = argparse.ArgumentParser(prog="omacash", description="AI provider balances for Omarchy")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_sync = sub.add_parser("sync", help="fetch stale providers, write snapshot + agents records")
+    p_sync = sub.add_parser("sync", help="fetch stale providers and write the snapshot")
     p_sync.add_argument("--force", action="store_true")
     p_sync.add_argument("--provider", choices=PROVIDERS)
     p_sync.set_defaults(fn=cmd_sync)
@@ -2937,7 +2824,7 @@ def main():
     sub.add_parser("setup", help="interactive first-run wizard").set_defaults(fn=cmd_setup)
     sub.add_parser("doctor", help="live-check every configured provider").set_defaults(fn=cmd_doctor)
     sub.add_parser("selftest", help="offline tests against tests/fixtures").set_defaults(fn=lambda a: run_selftest())
-    sub.add_parser("cleanup", help="remove agents records and the state dir").set_defaults(fn=cmd_cleanup)
+    sub.add_parser("cleanup", help="remove the state dir and any leftover agents records").set_defaults(fn=cmd_cleanup)
 
     args = parser.parse_args()
     try:
