@@ -306,11 +306,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    // The keys form lists all providers and is taller than the balances view.
-    // Let it use the available screen height so the last card (OpenCode) is
-    // visible without scrolling on a normal display; small screens still scroll.
-    contentHeight: panel.fittedContentHeight(column.implicitHeight,
-      root.keysOpen ? 0 : Style.space(640))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(640))
 
     PanelKeyCatcher {
       id: keyCatcher
