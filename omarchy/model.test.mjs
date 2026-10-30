@@ -246,12 +246,12 @@ assert.doesNotMatch(keysViewSource,
 
 // The exact console URL per provider, asserted against the Model table.
 const KEY_URLS = {
-  'opencode': 'https://opencode.ai/console',
   'openrouter': 'https://openrouter.ai/settings/management-keys',
   'vercel-ai': 'https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fapi-keys&title=AI+Gateway+API+Keys',
   'elevenlabs': 'https://elevenlabs.io/app/developers/api-keys',
   'openai-api': 'https://platform.openai.com/settings/organization/admin-keys',
-  'anthropic-api': 'https://platform.claude.com/settings/admin-keys'
+  'anthropic-api': 'https://platform.claude.com/settings/admin-keys',
+  'opencode': 'https://opencode.ai/console'
 };
 assert.deepEqual(JSON.parse(JSON.stringify(model.keyProviderIds())), Object.keys(KEY_URLS));
 for (const [id, url] of Object.entries(KEY_URLS)) {
