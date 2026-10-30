@@ -8,7 +8,7 @@ If something here conflicts with any other document, THIS file wins.
 - Plugin id: `io.github.baranskyi.omacash`
 - CLI file: `bin/omacash` (invoked as `/usr/bin/env python3 <pluginDir>/bin/omacash …`)
 - Provider ids (fixed, used everywhere — config, cache, snapshot):
-  `openrouter`, `vercel-ai`, `elevenlabs`, `openai-api`, `anthropic-api`
+  `openrouter`, `vercel-ai`, `elevenlabs`, `openai-api`, `anthropic-api`, `opencode`
 - State dir: `~/.local/state/omarchy/io.github.baranskyi.omacash/`
   (`config.json`, `secrets.json`, `cache/<id>.json`, `snapshot.json`, `alerts.json`, `lock` — every
   one of them 0600, in a 0700 dir; see "State directory safety")
@@ -52,17 +52,18 @@ If something here conflicts with any other document, THIS file wins.
 ```
 
 Rules:
-- Money amounts in **snapshot** are **decimal strings** ("23.40"). `percentRemaining` is a JSON number 0..1 or null. ElevenLabs `balance.currency` is `"credits"` and its amounts are integer strings ("71000").
+- Money amounts in **snapshot** are **decimal strings** ("23.40"). `percentRemaining` is a JSON number 0..1 or null. ElevenLabs `balance.currency` is `"credits"` and its amounts are integer strings ("71000"). OpenCode Go uses `balance.currency` `"percent"`: `remaining`/`funded`/`spent` are percentage points (for example `"72"`, `"100"`, `"28"`), the headline is the 5-hour window, and `resetsAt` is that window's reset.
 - `status` ∈ `ok | error | unconfigured`. `severity` ∈ `ok | low | critical | unknown`.
 - `source` ∈ `credits | key-limit | subscription | ledger`.
 - `error` is null or `{ "kind": "auth|network|http|config|unit-suspect|stale-expired", "message": "...", "hint": "..." }`. `hint` (top-level) is only for `unconfigured` rows. Hints/authHelpText spell out the full invocation, `"python3 " + abspath(CLI)` (e.g. "Run: python3 <pluginDir>/bin/omacash key set openrouter"), since bare `omacash` is not on PATH.
 - `stale:true` = showing last-good data after a failed refresh; kept ≤ 7 days, then `balance:null` + error kind `stale-expired`.
 - `estimated:true` on ledger-derived balances (openai-api, anthropic-api) and on any value the CLI computed rather than read.
-- `totalRemainingUsd`: sum of USD `remaining` over ready providers only (credits excluded); decimal string; `"0.00"` if none. `anyEstimated`: any summed entry estimated.
+- `totalRemainingUsd`: sum of USD `remaining` over ready providers only (credits and percentages excluded); decimal string; `"0.00"` if none. `anyEstimated`: any summed entry estimated. OpenCode Zen (USD) is included; OpenCode Go (a subscription quota) is not.
 - `attention`: provider id with the worst severity (critical > low), ties broken by lowest percentRemaining; null when all ok/unknown.
 - Severity thresholds (config-overridable): low if percentRemaining < 0.20 OR remaining < $10; critical if < 0.05 OR < $3. For credits (elevenlabs) only the percent rules apply.
 - ALL provider-originated strings are sanitized by the CLI before writing (strip control chars, replace `<` `>` with `‹` `›`, cap 200 chars). The QML additionally hard-bounds list sizes (max 8 providers).
-- Providers appear in the fixed order: openrouter, vercel-ai, elevenlabs, openai-api, anthropic-api. Disabled providers (config `enabled:false`) are omitted entirely; unconfigured (no key) appear with status `unconfigured`.
+- Providers appear in the fixed order: openrouter, vercel-ai, elevenlabs, openai-api, anthropic-api, opencode. Disabled providers (config `enabled:false`) are omitted entirely; unconfigured (no key) appear with status `unconfigured`.
+- OpenCode is one provider/key with automatic mode detection. The CLI probes `GET {base}/zen/go/v1/usage` (Go quota) and `GET {base}/console/api/billing/status` (Zen balance). A Go reply wins; otherwise a Zen reply is used; when both exist the Go row's `detail` also names the Zen balance. Go uses `source:"subscription"` and `currency:"percent"`, with the `rolling` (5-hour) window as the headline; Zen uses `source:"credits"`, `currency:"USD"` and `funded:null`.
 
 ## QML data path (the shell never touches the filesystem)
 
@@ -119,7 +120,7 @@ Versions up to 0.1.0 mirrored every balance into Omarchy's built-in **Agents** p
 `agents/usage/<provider-id>.json`. That panel is for the coding agents running on the machine,
 so this plugin no longer writes there and shows balances in its own panel only.
 
-`sync` and `cleanup` unlink `<provider-id>.json` for the five provider ids and nothing else —
+`sync` and `cleanup` unlink `<provider-id>.json` for the six provider ids and nothing else —
 records written by Omarchy's own collectors (`claude.json`, `codex.json`, …) are never touched.
 The sweep is janitorial: when `agents/usage` is absent, is a symlink, or is writable by group or
 other, it is left alone rather than failing the command. The directory itself is never created
@@ -197,7 +198,8 @@ open file descriptor it validated itself.
     "vercel-ai":     { "enabled": true },
     "elevenlabs":    { "enabled": true, "baseUrl": "https://api.elevenlabs.io" },
     "openai-api":    { "enabled": true, "ledger": { "entries": [ {"date":"2026-08-01","amount":"60.00"} ] } },
-    "anthropic-api": { "enabled": true, "amounts_are_cents": true, "ledger": { "entries": [ {"date":"2026-07-15","amount":"50.00"} ] } }
+    "anthropic-api": { "enabled": true, "amounts_are_cents": true, "ledger": { "entries": [ {"date":"2026-07-15","amount":"50.00"} ] } },
+    "opencode":      { "enabled": true, "baseUrl": "https://opencode.ai" }
   }
 }
 ```
@@ -206,7 +208,7 @@ open file descriptor it validated itself.
 
 ## secrets.json (0600)
 
-Flat `{ "<provider-id>": "<key>" }`. Written only by `key set`/`setup` (stdin/getpass). Env overrides honored for doctor/testing only: `OPENROUTER_KEY`, `VERCEL_AI_GATEWAY_KEY`, `ELEVENLABS_API_KEY`, `OPENAI_ADMIN_KEY`, `ANTHROPIC_ADMIN_KEY`.
+Flat `{ "<provider-id>": "<key>" }`. Written only by `key set`/`setup` (stdin/getpass). Env overrides honored for doctor/testing only: `OPENROUTER_KEY`, `VERCEL_AI_GATEWAY_KEY`, `ELEVENLABS_API_KEY`, `OPENAI_ADMIN_KEY`, `ANTHROPIC_ADMIN_KEY`, `OPENCODE_API_KEY`.
 
 In-panel key entry: `omarchy/KeysView.qml` (opened from the popup's "Keys" footer button or by clicking an unconfigured row) is the second writer path for the stdin-only rule. It runs the same `key set <id>` / `key clear <id>` CLI through a Quickshell `Process` whose command array holds only fixed constants (the CLI path plus a provider id from the list above); the key value itself is delivered exclusively via `write(key + "\n")` on the process's stdin (`stdinEnabled: true`, closed right after the write so the CLI's stdin read reaches EOF). The QML clears the input field on submit and drops the held value after the write, so the key never appears in argv, the environment, QML state after send, `shell.json`, or logs. There are therefore exactly two writers of `secrets.json`: `setup`/`key set` in a terminal, and KeysView over `Process` stdin — both stdin-only, and both taking the state lock around the read-modify-write (see "Concurrency"), so one panel's save never drops another's key. Configured/unconfigured state in the Keys view is read from the current snapshot (`status !== "unconfigured"`); no extra CLI status command exists for it. Esc may not abort a save: `Panel.qml` holds the KeysView `Loader` active (hidden) for as long as the view reports a run outstanding (`activeId !== ""`, set before the `Process` starts and cleared only after the result has been applied), so the row state and the follow-up forced sync always happen even if the user closes the view the instant after pressing Save.
 

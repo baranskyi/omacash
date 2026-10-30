@@ -18,6 +18,7 @@
       "enabled": true,
       "amounts_are_cents": true,
       "ledger": { "entries": [ { "date": "2026-07-15", "amount": "50.00" } ] }
-    }
+    },
+    "opencode": { "enabled": true, "baseUrl": "https://opencode.ai" }
   }
 }

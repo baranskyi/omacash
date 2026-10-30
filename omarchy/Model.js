@@ -9,13 +9,14 @@ var MAX_PROVIDERS = 8
 // sees it — a runaway or tampered producer must not be able to grow the
 // shell's heap. Real snapshots are a few kilobytes.
 var MAX_SNAPSHOT_BYTES = 1048576
-var PROVIDER_ORDER = ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api"]
+var PROVIDER_ORDER = ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api", "opencode"]
 var SHORT_TAGS = {
   "openrouter": "OR",
   "vercel-ai": "VA",
   "elevenlabs": "EL",
   "openai-api": "OA",
-  "anthropic-api": "AN"
+  "anthropic-api": "AN",
+  "opencode": "OC"
 }
 
 function cleanText(value, maxLength) {
@@ -178,6 +179,15 @@ function formatMoney(value) {
   return match[1] + "$" + whole + "." + cents
 }
 
+function formatPercent(value) {
+  var text = String(value === undefined || value === null ? "" : value).trim()
+  if (!/^-?\d{1,15}(\.\d{1,15})?$/.test(text)) return ""
+  var number = Number(text)
+  if (!isFinite(number)) return ""
+  var rounded = Math.round(number * 10) / 10
+  return (Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)) + "%"
+}
+
 function formatCredits(value) {
   var match = /^(-?)(\d{1,15})$/.exec(String(value === undefined || value === null ? "" : value).trim())
   if (!match) return ""
@@ -277,9 +287,10 @@ function cyclePinned(model, currentId, step) {
 function providerValue(p) {
   if (!p || p.status === "unconfigured") return "—"
   if (!p.balance) return p.status === "error" ? "!" : "—"
-  var text = p.balance.currency === "credits"
-    ? formatCredits(p.balance.remaining)
-    : formatMoney(p.balance.remaining)
+  var text
+  if (p.balance.currency === "credits") text = formatCredits(p.balance.remaining)
+  else if (p.balance.currency === "percent") text = formatPercent(p.balance.remaining)
+  else text = formatMoney(p.balance.remaining)
   if (text === "") return "—"
   return (p.balance.estimated ? "~" : "") + text
 }
@@ -473,6 +484,11 @@ var KEY_META = {
     url: "https://platform.claude.com/settings/admin-keys",
     note: "Admin key sk-ant-admin…; requires a Console organization",
     needsLedger: true
+  },
+  "opencode": {
+    label: "OpenCode",
+    url: "https://opencode.ai/console",
+    note: "Go key, or a personal key with Billing: Read for Zen"
   }
 }
 

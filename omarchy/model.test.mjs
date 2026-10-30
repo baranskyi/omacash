@@ -250,7 +250,8 @@ const KEY_URLS = {
   'vercel-ai': 'https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fapi-keys&title=AI+Gateway+API+Keys',
   'elevenlabs': 'https://elevenlabs.io/app/developers/api-keys',
   'openai-api': 'https://platform.openai.com/settings/organization/admin-keys',
-  'anthropic-api': 'https://platform.claude.com/settings/admin-keys'
+  'anthropic-api': 'https://platform.claude.com/settings/admin-keys',
+  'opencode': 'https://opencode.ai/console'
 };
 assert.deepEqual(JSON.parse(JSON.stringify(model.keyProviderIds())), Object.keys(KEY_URLS));
 for (const [id, url] of Object.entries(KEY_URLS)) {
@@ -265,6 +266,7 @@ assert.equal(model.providerKeyMeta('anthropic-api').needsLedger, true);
 assert.equal(model.providerKeyMeta('openrouter').needsLedger, false);
 assert.equal(model.providerKeyMeta('vercel-ai').needsLedger, false);
 assert.equal(model.providerKeyMeta('elevenlabs').needsLedger, false);
+assert.equal(model.providerKeyMeta('opencode').needsLedger, false);
 assert.equal(model.providerKeyMeta('nope'), null);
 assert.equal(model.providerKeyMeta(null), null);
 
@@ -423,6 +425,13 @@ assert.equal(model.formatCredits('250000'), '250k cr');
 assert.equal(model.formatCredits('999'), '999 cr');
 assert.equal(model.formatCredits('1500000'), '1.5M cr');
 assert.equal(model.formatCredits('12.5'), '');
+
+assert.equal(model.formatPercent('72'), '72%');
+assert.equal(model.formatPercent('72.5'), '72.5%');
+assert.equal(model.formatPercent('0'), '0%');
+assert.equal(model.formatPercent('100'), '100%');
+assert.equal(model.formatPercent('12,5'), '');
+assert.equal(model.formatPercent(''), '');
 
 const HOUR = 3600000, DAY = 24 * HOUR, MINUTE = 60000;
 assert.equal(model.formatReset(new Date(NOW + DAY + HOUR + MINUTE).toISOString(), NOW), 'Resets in 1d 1h');
@@ -602,6 +611,42 @@ assert.equal(critRow.meterRole, 'urgent');
 
 assert.equal(model.providerRows(null, NOW).length, 0);
 
+// OpenCode is one row whose unit depends on the detected account: Go is a
+// subscription quota percentage, Zen is a prepaid USD balance.
+const opencodeGo = model.parseSnapshot(JSON.stringify({
+  schemaVersion: 1, generatedAt: '2026-10-30T12:00:00Z', totalRemainingUsd: '0.00',
+  anyEstimated: false, attention: null, providers: [
+    {id: 'opencode', name: 'OpenCode', status: 'ok', source: 'subscription',
+     balance: {remaining: '72', funded: '100', spent: '28', currency: 'percent', estimated: false},
+     percentRemaining: 0.72, severity: 'ok', resetsAt: '2026-10-30T18:00:00Z',
+     ledgerSince: null, detail: '5h 28% used · week 40% used · month 61% used',
+     fetchedAt: '2026-10-30T12:00:00Z', stale: false, error: null, hint: null}
+  ]})).model;
+const opencodeGoRow = model.providerRow(opencodeGo.providers[0], NOW);
+assert.equal(opencodeGoRow.value, '72%');
+assert.equal(opencodeGoRow.tier, 'Subscription');
+assert.equal(opencodeGoRow.percent, 0.72);
+assert.match(opencodeGoRow.sub, /^5h 28% used/);
+assert.equal(model.barText(opencodeGo, 'pinned', 'opencode', false, false), '72%');
+assert.equal(model.barText(opencodeGo, 'pinned', 'opencode', true, false), 'OC 72%');
+assert.equal(model.totalText(opencodeGo), '$0.00');
+
+const opencodeZen = model.parseSnapshot(JSON.stringify({
+  schemaVersion: 1, generatedAt: '2026-10-30T12:00:00Z', totalRemainingUsd: '12.34',
+  anyEstimated: false, attention: null, providers: [
+    {id: 'opencode', name: 'OpenCode', status: 'ok', source: 'credits',
+     balance: {remaining: '12.34', funded: null, spent: '0', currency: 'USD', estimated: false},
+     percentRemaining: null, severity: 'ok', resetsAt: null, ledgerSince: null,
+     detail: 'Prepaid balance', fetchedAt: '2026-10-30T12:00:00Z',
+     stale: false, error: null, hint: null}
+  ]})).model;
+const opencodeZenRow = model.providerRow(opencodeZen.providers[0], NOW);
+assert.equal(opencodeZenRow.value, '$12.34');
+assert.equal(opencodeZenRow.tier, 'Prepaid');
+assert.equal(opencodeZenRow.percent, -1);
+assert.equal(model.barText(opencodeZen, 'pinned', 'opencode', true, false), 'OC $12.34');
+assert.equal(model.totalText(opencodeZen), '$12.34');
+
 // --------------------------------------------------------------- settings
 
 assert.equal(model.cyclePinned(snap, 'openrouter', 1), 'vercel-ai');
@@ -609,7 +654,7 @@ assert.equal(model.cyclePinned(snap, 'anthropic-api', 1), 'openrouter');
 assert.equal(model.cyclePinned(snap, 'openrouter', -1), 'anthropic-api');
 assert.equal(model.cyclePinned(snap, 'unknown', 1), 'vercel-ai');
 assert.equal(model.cyclePinned(null, 'openrouter', 1), 'vercel-ai');
-assert.equal(model.cyclePinned(null, 'anthropic-api', 1), 'openrouter');
+assert.equal(model.cyclePinned(null, 'anthropic-api', 1), 'opencode');
 
 assert.equal(model.pillModeSetting('attention'), 'attention');
 assert.equal(model.pillModeSetting('pinned'), 'pinned');

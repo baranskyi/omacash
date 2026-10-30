@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.baranskyi.omacash",
   "name": "Omacash",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Slava Baranskyi",
   "license": "MIT",
-  "description": "Remaining money and credits across OpenRouter, Vercel AI Gateway, ElevenLabs, OpenAI, and Anthropic in one bar pill and popup.",
+  "description": "Remaining money and credits across OpenRouter, Vercel AI Gateway, ElevenLabs, OpenAI, Anthropic, and OpenCode in one bar pill and popup.",
   "kinds": [
     "bar-widget",
     "service"
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Omacash",
-    "description": "Prepaid balances, credits, and ledger-estimated remainders for five AI providers, with severity meters and reset countdowns.",
+    "description": "Prepaid balances, credits, usage quotas, and ledger-estimated remainders for six AI providers, with severity meters and reset countdowns.",
     "category": "AI",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -39,7 +39,7 @@
         "type": "enum",
         "label": "Pinned provider",
         "description": "Provider shown when pillMode is pinned. The mouse wheel on the pill cycles this.",
-        "options": ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api"],
+        "options": ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api", "opencode"],
         "defaultValue": "openrouter"
       },
       {
