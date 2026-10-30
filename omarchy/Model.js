@@ -10,6 +10,11 @@ var MAX_PROVIDERS = 8
 // shell's heap. Real snapshots are a few kilobytes.
 var MAX_SNAPSHOT_BYTES = 1048576
 var PROVIDER_ORDER = ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api", "opencode"]
+// Keys-view order is separate from the snapshot order. OpenCode is first so its
+// key field is visible without scrolling: the keys list is longer than the
+// popup, and the panel's key catcher is blocked while the view is open (j/k
+// cannot scroll it), so a provider at the bottom is easy to miss.
+var KEY_PROVIDER_ORDER = ["opencode", "openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api"]
 var SHORT_TAGS = {
   "openrouter": "OR",
   "vercel-ai": "VA",
@@ -493,7 +498,7 @@ var KEY_META = {
 }
 
 function keyProviderIds() {
-  return PROVIDER_ORDER.slice()
+  return KEY_PROVIDER_ORDER.slice()
 }
 
 function providerKeyMeta(id) {
