@@ -25,13 +25,14 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 PLUGIN_ID = "io.github.baranskyi.omacash"
-PROVIDERS = ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api"]
+PROVIDERS = ["openrouter", "vercel-ai", "elevenlabs", "openai-api", "anthropic-api", "opencode"]
 NAMES = {
     "openrouter": "OpenRouter",
     "vercel-ai": "Vercel AI",
     "elevenlabs": "ElevenLabs",
     "openai-api": "OpenAI API",
     "anthropic-api": "Anthropic API",
+    "opencode": "OpenCode",
 }
 LEDGER_PROVIDERS = ("openai-api", "anthropic-api")
 # Env overrides are honored by doctor/setup live tests only, never by sync.
@@ -41,8 +42,11 @@ ENV_KEYS = {
     "elevenlabs": "ELEVENLABS_API_KEY",
     "openai-api": "OPENAI_ADMIN_KEY",
     "anthropic-api": "ANTHROPIC_ADMIN_KEY",
+    "opencode": "OPENCODE_API_KEY",
 }
 UA = "omacash/0.1"
+# OpenCode Console reports billing amounts in micro-cents: 1 USD = 100,000,000.
+OPENCODE_MICROCENTS_PER_USD = Decimal(100_000_000)
 # How this CLI is invoked in user-facing hints (self-generated, never provider-originated).
 INVOKE = "python3 " + os.path.abspath(__file__)
 TIMEOUT = 10
@@ -549,6 +553,7 @@ def default_config():
             "elevenlabs": {"enabled": True, "baseUrl": "https://api.elevenlabs.io"},
             "openai-api": {"enabled": True, "ledger": {"entries": []}},
             "anthropic-api": {"enabled": True, "amounts_are_cents": True, "ledger": {"entries": []}},
+            "opencode": {"enabled": True, "baseUrl": "https://opencode.ai"},
         },
     }
 
@@ -821,19 +826,19 @@ def fetch_vercel(key, pcfg, http):
     }
 
 
-def check_base_url(base):
+def check_base_url(base, pid):
     # https only, except loopback for tests/mocks
     parts = urllib.parse.urlsplit(base)
     ok = parts.scheme == "https" or (
         parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1"))
     if not ok:
         raise FetchError("config", f"baseUrl must use https: {base}",
-                         "Fix providers.elevenlabs.baseUrl in config.json")
+                         f"Fix providers.{pid}.baseUrl in config.json")
 
 
 def fetch_elevenlabs(key, pcfg, http):
     base = (pcfg.get("baseUrl") or "https://api.elevenlabs.io").rstrip("/")
-    check_base_url(base)
+    check_base_url(base, "elevenlabs")
     status, body = http(base + "/v1/user/subscription", {"xi-api-key": key})
     if status != 200:
         raise_http(status, body)
@@ -851,6 +856,165 @@ def fetch_elevenlabs(key, pcfg, http):
         "spent": Decimal(count), "currency": "credits", "estimated": False,
         "resetsAt": resets_at, "ledgerSince": None, "tierLabel": tier, "clamped": False,
     }
+
+
+def fmt_pct(d):
+    """A percentage as a compact decimal string: 72, 72.5 (never 72.0)."""
+    q = d.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    if q == q.to_integral_value():
+        return str(int(q))
+    return str(q)
+
+
+def _opencode_probe(http, url, key):
+    """One OpenCode endpoint probe. Returns {status, body} or {error} without raising."""
+    try:
+        status, body = http(url, {"Authorization": f"Bearer {key}", "Accept": "application/json"})
+        return {"status": status, "body": body}
+    except FetchError as e:
+        return {"error": e}
+
+
+def _opencode_http_error(status, body):
+    try:
+        raise_http(status, body)
+    except FetchError as e:
+        return e
+    raise AssertionError("raise_http did not raise")  # pragma: no cover
+
+
+def _opencode_go_windows(body):
+    """Validate /zen/go/v1/usage and return its rolling/weekly/monthly windows."""
+    try:
+        obj = jload_dict(body)
+        usage = obj.get("usage")
+        if not isinstance(usage, dict):
+            raise ValueError("usage must be an object")
+        windows = {}
+        for name in ("rolling", "weekly", "monthly"):
+            window = usage.get(name)
+            if window is None and name != "rolling":
+                continue
+            if not isinstance(window, dict):
+                raise ValueError(f"{name} must be an object")
+            percent = dec(window["percent"])
+            if not percent.is_finite() or percent < 0 or percent > 100:
+                raise ValueError(f"{name}.percent must be 0..100")
+            status = window.get("status") or "ok"
+            resets_at = window.get("resetsAt")
+            if resets_at is not None and not isinstance(resets_at, str):
+                raise ValueError(f"{name}.resetsAt must be a string")
+            windows[name] = {"percent": percent, "status": status, "resetsAt": resets_at}
+        return windows
+    except FetchError:
+        raise
+    except (KeyError, TypeError, ValueError, InvalidOperation, AttributeError) as e:
+        raise FetchError("http", f"unexpected Go usage response: {e}") from e
+
+
+def _opencode_zen_balance(body):
+    """Validate /console/api/billing/status and return the prepaid balance in USD."""
+    try:
+        obj = jload_dict(body)
+        microcents = dec(obj["balanceMicroCents"])
+    except FetchError:
+        raise
+    except (KeyError, TypeError, ValueError, InvalidOperation, AttributeError) as e:
+        raise FetchError("http", f"unexpected Zen billing response: {e}") from e
+    if not microcents.is_finite():
+        raise FetchError("http", "unexpected Zen billing response: balance is not finite")
+    return max(Decimal("0"), microcents / OPENCODE_MICROCENTS_PER_USD)
+
+
+def _normalize_opencode_go(windows, zen_balance):
+    labels = {"rolling": "5h", "weekly": "week", "monthly": "month"}
+    rolling = windows["rolling"]
+    used = Decimal("100") if rolling["status"] == "rate-limited" else rolling["percent"]
+    remaining = min(Decimal("100"), max(Decimal("0"), Decimal("100") - used))
+    parts = []
+    for name in ("rolling", "weekly", "monthly"):
+        window = windows.get(name)
+        if window is not None:
+            pct = Decimal("100") if window["status"] == "rate-limited" else window["percent"]
+            parts.append(f"{labels[name]} {fmt_pct(pct)}% used")
+    detail = " · ".join(parts)
+    if zen_balance is not None:
+        detail += f" · Zen ${fmt_money(zen_balance)} balance"
+    return {
+        "source": "subscription", "remaining": remaining, "funded": Decimal("100"),
+        "spent": Decimal("100") - remaining, "currency": "percent", "estimated": False,
+        "resetsAt": rolling.get("resetsAt"), "ledgerSince": None, "tierLabel": "Go quota",
+        "clamped": False, "detail": detail,
+        "usageText": f"{fmt_pct(remaining)}% of 5h quota remaining",
+    }
+
+
+def _normalize_opencode_zen(balance):
+    return {
+        "source": "credits", "remaining": balance, "funded": None, "spent": Decimal("0"),
+        "currency": "USD", "estimated": False, "resetsAt": None, "ledgerSince": None,
+        "tierLabel": "Prepaid", "clamped": False, "detail": "Prepaid balance",
+        "usageText": f"${fmt_money(balance)} remaining",
+    }
+
+
+def fetch_opencode(key, pcfg, http):
+    """OpenCode Go and Zen share one key entry; probe both and show the active account.
+
+    Go is a subscription: the headline is the 5-hour quota remaining as a percentage.
+    Zen is pay-as-you-go: the headline is the prepaid USD balance. When both are
+    available, Go wins and the Zen balance is mentioned in the row's detail.
+    """
+    base = (pcfg.get("baseUrl") or "https://opencode.ai").rstrip("/")
+    check_base_url(base, "opencode")
+    go = _opencode_probe(http, base + "/zen/go/v1/usage", key)
+    zen = _opencode_probe(http, base + "/console/api/billing/status", key)
+
+    go_windows = None
+    if go.get("status") == 200:
+        try:
+            go_windows = _opencode_go_windows(go["body"])
+        except FetchError as e:
+            go["parseError"] = e
+    zen_balance = None
+    if zen.get("status") == 200:
+        try:
+            zen_balance = _opencode_zen_balance(zen["body"])
+        except FetchError as e:
+            zen["parseError"] = e
+
+    if go_windows is not None:
+        return _normalize_opencode_go(go_windows, zen_balance)
+    if zen_balance is not None:
+        return _normalize_opencode_zen(zen_balance)
+
+    # Neither account answered with data. Prefer a real transport error, then an
+    # authentication/entitlement explanation, then the first HTTP response.
+    for probe in (go, zen):
+        err = probe.get("error")
+        if err is not None and err.kind == "network":
+            raise err
+    go_status, zen_status = go.get("status"), zen.get("status")
+    if go_status in (401, 403) and zen_status in (401, 403):
+        if go_status == 401 or zen_status == 401:
+            raise FetchError(
+                "auth", "OpenCode rejected the API key",
+                f"Run: {INVOKE} key set opencode with a valid OpenCode key",
+            )
+        raise FetchError(
+            "auth", "OpenCode key has no Go subscription and cannot read Zen billing",
+            "Use a Go API key, or a personal OpenCode key with Billing: Read for Zen",
+        )
+    for probe in (go, zen):
+        if probe.get("parseError") is not None:
+            raise probe["parseError"]
+    for probe in (go, zen):
+        if probe.get("error") is not None:
+            raise probe["error"]
+        status = probe.get("status")
+        if status is not None:
+            raise _opencode_http_error(status, probe.get("body", b""))
+    raise FetchError("network", "OpenCode did not respond")
 
 
 def ledger_entries(pcfg):
@@ -1001,6 +1165,8 @@ def fetch_provider(pid, key, pcfg, http, cache, today):
         return fetch_vercel(key, pcfg, http)
     if pid == "elevenlabs":
         return fetch_elevenlabs(key, pcfg, http)
+    if pid == "opencode":
+        return fetch_opencode(key, pcfg, http)
     return fetch_ledger_provider(pid, key, pcfg, http, cache, today)
 
 
@@ -1020,10 +1186,14 @@ def severity_of(remaining, percent, currency, th):
 def _fm(norm):
     if norm["currency"] == "credits":
         return lambda d: str(int(d))
+    if norm["currency"] == "percent":
+        return fmt_pct
     return fmt_money
 
 
 def detail_for(pid, norm):
+    if norm.get("detail") is not None:
+        return norm["detail"]
     fm = _fm(norm)
     spent, funded = norm["spent"], norm["funded"]
     if pid == "elevenlabs":
@@ -1041,6 +1211,8 @@ def detail_for(pid, norm):
 
 
 def usage_text_for(pid, norm):
+    if norm.get("usageText") is not None:
+        return norm["usageText"]
     fm = _fm(norm)
     if pid == "openrouter":
         return f"${fm(norm['remaining'])} remaining · ${fm(norm['spent'])} used"
@@ -1702,6 +1874,8 @@ def cmd_doctor(args):
                 fm = _fm(norm)
                 if norm["currency"] == "credits":
                     summary = f"{int(norm['remaining']):,} credits remaining"
+                elif norm["currency"] == "percent":
+                    summary = f"{fm(norm['remaining'])}% of 5h quota remaining"
                 else:
                     summary = f"${fm(norm['remaining'])} remaining"
                 print(f"{pid:<15} OK    {summary} [{norm['source']}] — {detail_for(pid, norm)}")
@@ -1912,6 +2086,92 @@ def run_selftest():
         assert severity_of(Decimal("50"), 0.5, "USD", th) == "ok"
         assert severity_of(None, None, "USD", th) == "unknown"
     t("severity thresholds (USD + credits-only-percent)", t_credit_severity)
+
+    # -- opencode: one entry, Go quota vs Zen balance auto-detection
+    def t_opencode_go():
+        http = http_of([
+            ("/zen/go/v1/usage", (200, fx("opencode-go-usage.json"))),
+            ("/console/api/billing/status", (403, fx("opencode-go-entitlement-403.json"))),
+        ])
+        norm = fetch_opencode("k", {}, http)
+        assert norm["source"] == "subscription", norm
+        assert norm["currency"] == "percent"
+        assert fmt_pct(norm["remaining"]) == "72"
+        assert fmt_pct(norm["spent"]) == "28"
+        assert norm["funded"] == Decimal("100")
+        assert norm["resetsAt"] == "2026-10-30T18:00:00Z"
+        assert "5h 28% used" in norm["detail"]
+        row = build_row("opencode", norm, "2026-10-30T12:00:00Z", th)
+        assert row["name"] == "OpenCode"
+        assert row["balance"]["remaining"] == "72"
+        assert row["balance"]["currency"] == "percent"
+        assert row["percentRemaining"] == 0.72
+        assert row["severity"] == "ok"
+        assert row["resetsAt"] == "2026-10-30T18:00:00Z"
+        snap = build_snapshot([row], utcnow())
+        assert snap["totalRemainingUsd"] == "0.00"  # quota % is not cash
+    t("opencode Go -> 5h quota percent, excluded from USD total", t_opencode_go)
+
+    def t_opencode_zen():
+        http = http_of([
+            ("/zen/go/v1/usage", (403, fx("opencode-go-entitlement-403.json"))),
+            ("/console/api/billing/status", (200, fx("opencode-zen-billing.json"))),
+        ])
+        norm = fetch_opencode("k", {}, http)
+        assert norm["source"] == "credits"
+        assert norm["currency"] == "USD"
+        assert fmt_money(norm["remaining"]) == "12.34"
+        assert norm["funded"] is None
+        row = build_row("opencode", norm, "2026-10-30T12:00:00Z", th)
+        assert row["balance"]["remaining"] == "12.34"
+        assert row["balance"]["funded"] is None
+        assert row["balance"]["currency"] == "USD"
+        assert row["percentRemaining"] is None
+        assert row["severity"] == "ok"
+        snap = build_snapshot([row], utcnow())
+        assert snap["totalRemainingUsd"] == "12.34"
+    t("opencode Zen -> prepaid USD balance, included in total", t_opencode_zen)
+
+    def t_opencode_both_prefers_go():
+        http = http_of([
+            ("/zen/go/v1/usage", (200, fx("opencode-go-usage.json"))),
+            ("/console/api/billing/status", (200, fx("opencode-zen-billing.json"))),
+        ])
+        norm = fetch_opencode("k", {}, http)
+        assert norm["currency"] == "percent"
+        assert "Zen $12.34 balance" in norm["detail"], norm["detail"]
+    t("opencode both accounts -> Go headline, Zen balance in detail", t_opencode_both_prefers_go)
+
+    def t_opencode_auth_errors():
+        for status, needle in ((401, "valid OpenCode key"), (403, "Billing: Read")):
+            http = http_of([
+                ("/zen/go/v1/usage", (status, b'{"error":{"message":"no"}}')),
+                ("/console/api/billing/status", (status, b'{"error":{"message":"no"}}')),
+            ])
+            try:
+                fetch_opencode("k", {}, http)
+                raise AssertionError("expected FetchError")
+            except FetchError as e:
+                assert e.kind == "auth", e.kind
+                assert needle in (e.hint or ""), e.hint
+    t("opencode detection surfaces key/subscription hints", t_opencode_auth_errors)
+
+    def t_opencode_base_url():
+        try:
+            fetch_opencode("k", {"baseUrl": "ftp://x"}, http_of([]))
+            raise AssertionError("expected FetchError")
+        except FetchError as e:
+            assert e.kind == "config"
+            assert "providers.opencode.baseUrl" in (e.hint or "")
+        base = "http://127.0.0.1:8123"
+        http = http_of([
+            ("/zen/go/v1/usage", (403, fx("opencode-go-entitlement-403.json"))),
+            ("/console/api/billing/status", (200, fx("opencode-zen-billing.json"))),
+        ])
+        norm = fetch_opencode("k", {"baseUrl": base}, http)
+        assert norm["currency"] == "USD"
+        assert all(url.startswith(base) for url, _ in http.calls)
+    t("opencode baseUrl requires https (loopback allowed)", t_opencode_base_url)
 
     # -- anthropic cents parse
     def t_anthropic_cents():

@@ -1,7 +1,7 @@
 # Omacash — money left on your AI services, in the Omarchy bar
 
 One pill in the Omarchy Quattro bar showing what is **left** — not what you spent — across
-five services, with a keyboard-navigable popup.
+six services, with a keyboard-navigable popup.
 
 | Service | What you see | How |
 |---|---|---|
@@ -10,10 +10,17 @@ five services, with a keyboard-navigable popup.
 | ElevenLabs | remaining credits + reset date | subscription API (key needs only the User: Read scope) |
 | OpenAI API | ≈ remaining $ *(estimated)* | your top-ups (a local ledger you maintain) minus the official Costs API spend |
 | Anthropic API | ≈ remaining $ *(estimated)* | same ledger approach over the official cost report |
+| OpenCode | Go: 5-hour quota % · Zen: remaining $ | Go usage API, or the Console billing endpoint (personal key with **Billing: Read**) |
 
 OpenAI and Anthropic expose **no balance endpoint at all**, so their rows are estimates:
 you record top-ups with `ledger add`, the plugin subtracts real API-reported spend and marks
 the result `≈`. Everything else is read straight from the provider.
+
+OpenCode is one row with one key. It detects the account automatically: an active Go
+subscription shows the 5-hour quota remaining as a percentage (with the weekly and monthly
+windows in the detail line), while a Zen pay-as-you-go balance shows the remaining dollars.
+If both are available, Go is the headline and the Zen balance appears in the detail. Go's
+quota is a plan allowance, not cash, so it is excluded from the pill's USD total.
 
 ## Requirements
 
@@ -21,7 +28,7 @@ the result `≈`. Everything else is read straight from the provider.
 - `python3` (any recent version; part of every Omarchy install). Stdlib only — no pip packages.
 - Optional: `libnotify` (`notify-send`) for low-balance notifications; part of Omarchy's defaults.
 
-No other external dependencies. The plugin talks only to the five provider APIs listed above.
+No other external dependencies. The plugin talks only to the provider APIs listed above.
 
 ## Install
 
@@ -45,6 +52,7 @@ updates. Keys you need:
 - **ElevenLabs** — an [API key](https://elevenlabs.io/app/developers/api-keys) with only the **User: Read** scope. Such a key cannot generate audio or spend credits.
 - **OpenAI API** — an [Admin key](https://platform.openai.com/settings/organization/admin-keys) (`sk-admin-…`), required by OpenAI's Costs API.
 - **Anthropic API** — an [Admin key](https://platform.claude.com/settings/admin-keys) (`sk-ant-admin…`) from the Claude Console, required by Anthropic's cost report. Needs a Console organization.
+- **OpenCode** — a Go API key, or a personal OpenCode [Console key](https://opencode.ai/console) with **Billing: Read** for the Zen balance. One key slot; the plugin probes both and shows the account it finds. Service-account keys cannot read Zen billing by design. Zen has no public balance API yet, so the row uses the same Console billing endpoint as the web app.
 
 **Terminal alternative** (same storage, guided and live-tested):
 
@@ -73,9 +81,9 @@ the panel's Keys view — stored in
 `~/.local/state/omarchy/io.github.baranskyi.omacash/secrets.json` (mode 600), sent only as
 HTTP headers to the provider's own API host, and never appear in process arguments,
 `shell.json` or logs. The Keys view clears its input field the moment you
-press Save. The OpenAI/Anthropic admin keys and the OpenRouter
-management key are powerful credentials — this plugin only reads with them, but treat the
-machine's disk as their security boundary.
+press Save. The OpenAI/Anthropic admin keys, the OpenRouter management key, and OpenCode
+keys with billing access are powerful credentials — this plugin only reads with them, but
+treat the machine's disk as their security boundary.
 
 Nothing in the shell opens that directory. The bar widget and popup hold no state path at all:
 a background service runs the bundled CLI and renders what the CLI prints, and the CLI is the

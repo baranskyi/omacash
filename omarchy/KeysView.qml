@@ -33,6 +33,31 @@ Column {
   property string pendingKey: ""
   property string savedId: ""
   property var rowErrors: ({})
+  // Only one provider card is expanded at a time, so all six headers fit in
+  // the 640px panel and the last one (OpenCode) stays visible. On first show,
+  // expand the first provider on a fresh install, otherwise the last one still
+  // missing a key — that surfaces a newly added provider at the bottom.
+  property string expandedId: ""
+  property bool expandedInitialized: false
+  function initializeExpanded() {
+    if (expandedInitialized) return
+    expandedInitialized = true
+    if (!snapshotModel) return
+    var unconfigured = []
+    var ids = Model.keyProviderIds()
+    for (var i = 0; i < ids.length; i++)
+      if (!Model.providerConfigured(snapshotModel, ids[i])) unconfigured.push(ids[i])
+    if (unconfigured.length === 0) return
+    var configured = Model.configuredProviders(snapshotModel)
+    expandedId = configured.length === 0
+      ? unconfigured[0]
+      : unconfigured[unconfigured.length - 1]
+  }
+  function toggleExpanded(id) {
+    expandedId = expandedId === id ? "" : id
+  }
+  Component.onCompleted: initializeExpanded()
+  onSnapshotModelChanged: if (!expandedInitialized) initializeExpanded()
   property string saveStderr: ""
   property string clearStderr: ""
   // Panel.qml binds PanelKeyCatcher.blocked to this (dev-gallery "Popups +
@@ -180,6 +205,7 @@ Column {
       readonly property string providerId: String(modelData)
       readonly property var meta: Model.providerKeyMeta(providerId)
       readonly property bool isConfigured: Model.providerConfigured(root.snapshotModel, providerId)
+      readonly property bool expanded: root.expandedId === providerId
       readonly property bool rowBusy: root.activeId === providerId
       readonly property string errorText: root.rowError(providerId)
 
@@ -218,7 +244,8 @@ Column {
 
           Text {
             id: stateLabel
-            anchors.right: parent.right
+            anchors.right: actionLabel.left
+            anchors.rightMargin: Style.spacing.md
             text: root.savedId === card.providerId ? "Saved ✓"
               : card.isConfigured ? "Configured ✓" : "Not set"
             textFormat: Text.PlainText
@@ -227,106 +254,131 @@ Column {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
-        }
 
-        Text {
-          width: parent.width
-          text: card.meta ? card.meta.note : ""
-          textFormat: Text.PlainText
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-        }
-
-        Text {
-          text: "Open key page ↗"
-          textFormat: Text.PlainText
-          color: root.accent
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          font.underline: linkArea.containsMouse
+          Text {
+            id: actionLabel
+            anchors.right: parent.right
+            text: card.expanded ? "Hide" : (card.isConfigured ? "Edit" : "Set key")
+            textFormat: Text.PlainText
+            color: root.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.underline: headerArea.containsMouse
+          }
 
           MouseArea {
-            id: linkArea
+            id: headerArea
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onClicked: if (card.meta) Qt.openUrlExternally(card.meta.url)
+            onClicked: root.toggleExpanded(card.providerId)
           }
         }
 
-        Text {
-          visible: card.meta ? card.meta.needsLedger === true : false
+        Column {
           width: parent.width
-          text: Model.ledgerHint(root.cliPath, card.providerId)
-          textFormat: Text.PlainText
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-        }
+          spacing: Style.space(6)
+          visible: card.expanded
 
-        Row {
-          width: parent.width
-          spacing: Style.space(8)
+          Text {
+            width: parent.width
+            text: card.meta ? card.meta.note : ""
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
 
-          TextField {
-            id: keyField
-            width: parent.width - saveButton.width - parent.spacing
-              - (clearButton.visible ? clearButton.width + parent.spacing : 0)
-            password: true
-            enabled: !root.busy
-            placeholderText: card.isConfigured ? "Paste a new key to replace" : "Paste API key"
-            foreground: root.foreground
-            onActiveFocusChanged: {
-              if (activeFocus) root.focusedField = keyField
-              else if (root.focusedField === keyField) root.focusedField = null
+          Text {
+            text: "Open key page ↗"
+            textFormat: Text.PlainText
+            color: root.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.underline: linkArea.containsMouse
+
+            MouseArea {
+              id: linkArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: if (card.meta) Qt.openUrlExternally(card.meta.url)
             }
-            Keys.onEscapePressed: root.forceActiveFocus()
-            onAccepted: root.submitKey(card.providerId, keyField)
           }
 
-          Button {
-            id: saveButton
-            anchors.verticalCenter: keyField.verticalCenter
-            text: card.rowBusy && root.activeAction === "set" ? "Saving…" : "Save"
-            bordered: true
-            focusable: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            verticalPadding: Style.spacing.controlPaddingY
-            enabled: !root.busy
-            onClicked: root.submitKey(card.providerId, keyField)
+          Text {
+            visible: card.meta ? card.meta.needsLedger === true : false
+            width: parent.width
+            text: Model.ledgerHint(root.cliPath, card.providerId)
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
-          Button {
-            id: clearButton
-            visible: card.isConfigured
-            anchors.verticalCenter: keyField.verticalCenter
-            text: card.rowBusy && root.activeAction === "clear" ? "Clearing…" : "Clear"
-            bordered: true
-            focusable: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            verticalPadding: Style.spacing.controlPaddingY
-            enabled: !root.busy
-            onClicked: root.clearKey(card.providerId)
-          }
-        }
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
 
-        Text {
-          visible: card.errorText !== ""
-          width: parent.width
-          text: card.errorText
-          textFormat: Text.PlainText
-          color: root.urgent
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-        }
+            TextField {
+              id: keyField
+              width: parent.width - saveButton.width - parent.spacing
+                - (clearButton.visible ? clearButton.width + parent.spacing : 0)
+              password: true
+              enabled: !root.busy
+              placeholderText: card.isConfigured ? "Paste a new key to replace" : "Paste API key"
+              foreground: root.foreground
+              onActiveFocusChanged: {
+                if (activeFocus) root.focusedField = keyField
+                else if (root.focusedField === keyField) root.focusedField = null
+              }
+              Keys.onEscapePressed: root.forceActiveFocus()
+              onAccepted: root.submitKey(card.providerId, keyField)
+            }
+
+            Button {
+              id: saveButton
+              anchors.verticalCenter: keyField.verticalCenter
+              text: card.rowBusy && root.activeAction === "set" ? "Saving…" : "Save"
+              bordered: true
+              focusable: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              verticalPadding: Style.spacing.controlPaddingY
+              enabled: !root.busy
+              onClicked: root.submitKey(card.providerId, keyField)
+            }
+
+            Button {
+              id: clearButton
+              visible: card.isConfigured
+              anchors.verticalCenter: keyField.verticalCenter
+              text: card.rowBusy && root.activeAction === "clear" ? "Clearing…" : "Clear"
+              bordered: true
+              focusable: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              verticalPadding: Style.spacing.controlPaddingY
+              enabled: !root.busy
+              onClicked: root.clearKey(card.providerId)
+            }
+          }
+
+          Text {
+            visible: card.errorText !== ""
+            width: parent.width
+            text: card.errorText
+            textFormat: Text.PlainText
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+          }
       }
     }
   }

@@ -338,7 +338,11 @@ Panel {
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        ScrollBar.vertical: ScrollBar {
+          // Keep the affordance visible in the keys form: its last card may be
+          // below the fold on shorter screens.
+          policy: root.keysOpen ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+        }
 
         Column {
           id: column
